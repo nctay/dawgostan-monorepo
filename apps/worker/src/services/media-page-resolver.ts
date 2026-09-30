@@ -1,4 +1,4 @@
-import { isMediaPageUrl, mediaTypeFromUrl } from "@archive/core";
+import { isMediaPageUrl, mediaTypeFromUrl } from "@dawgostan/core";
 
 const POSTIMAGE_CANDIDATE_URL = /https?:\/\/i\.postimg\.cc\/[^"' <>\]]+/gi;
 

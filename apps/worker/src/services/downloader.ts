@@ -3,11 +3,11 @@ import dns from "node:dns/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
-import { promisify } from "node:util";
-import { assertSafeResolvedAddress, assertSafeUrl, getExtension, isAnimatedWebp, isPlatformMediaUrl, isYandexDiskUrl, maxBytesForMediaType, mediaTypeFromContentType, mediaTypeFromUrl, normalizeUrl, toUrl } from "@archive/core";
+import { assertSafeResolvedAddress, assertSafeUrl, getExtension, isAnimatedWebp, isPlatformMediaUrl, isYandexDiskUrl, maxBytesForMediaType, mediaTypeFromContentType, mediaTypeFromUrl, normalizeUrl, toUrl } from "@dawgostan/core";
+import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegram } from "@dawgostan/media-processing";
 import { prisma } from "../prisma.js";
 import { env } from "../env.js";
 import { storeMedia } from "./storage.js";
@@ -30,7 +30,6 @@ type DownloadResult = {
 const shaLocks = new Map<string, Promise<void>>();
 const youtubeCookiesFile = "/run/private/youtube-cookies.txt";
 const telegramVideoMaxBytes = 49_900_000;
-const execFileAsync = promisify(execFile);
 
 export async function processDownloadQueue(): Promise<void> {
   const slots = Math.max(1, env.MAX_PARALLEL_DOWNLOADS);
@@ -452,7 +451,7 @@ async function finalizeDownload(filePath: string, mediaType: "image" | "video", 
     if (finalMediaType === "image" && isGifMime(finalOriginalMimeType)) {
       finalPath = path.join(os.tmpdir(), `archive-animation-${crypto.randomUUID()}.mp4`);
       console.log(`[image] converting gif input=${path.basename(filePath)} output=${path.basename(finalPath)}`);
-      await transcodeForTelegram(filePath, finalPath);
+      await transcodeForTelegram(filePath, finalPath, { timeoutMs: env.PLATFORM_DOWNLOAD_TIMEOUT_MS });
       await fs.promises.rm(filePath, { force: true }).catch(() => undefined);
       finalMediaType = "video";
       finalOriginalMimeType = undefined;
@@ -463,7 +462,7 @@ async function finalizeDownload(filePath: string, mediaType: "image" | "video", 
     if (finalMediaType === "image" && isWebpMime(finalOriginalMimeType) && (await isAnimatedWebpFile(filePath))) {
       finalPath = path.join(os.tmpdir(), `archive-animation-${crypto.randomUUID()}.mp4`);
       console.log(`[image] converting animated webp input=${path.basename(filePath)} output=${path.basename(finalPath)}`);
-      await convertAnimatedWebpToMp4(filePath, finalPath);
+      await convertAnimatedWebpToMp4(filePath, finalPath, { timeoutMs: env.PLATFORM_DOWNLOAD_TIMEOUT_MS });
       await fs.promises.rm(filePath, { force: true }).catch(() => undefined);
       finalMediaType = "video";
       finalOriginalMimeType = undefined;
@@ -472,7 +471,7 @@ async function finalizeDownload(filePath: string, mediaType: "image" | "video", 
     }
 
     if (finalMediaType === "image") {
-      const normalizedPhoto = await normalizePhotoForTelegram(finalPath, finalOriginalMimeType);
+      const normalizedPhoto = await normalizePhotoForTelegram(finalPath, finalOriginalMimeType, { timeoutMs: env.PLATFORM_DOWNLOAD_TIMEOUT_MS });
       if (normalizedPhoto.filePath !== finalPath) {
         const inputPath = finalPath;
         finalPath = normalizedPhoto.filePath;
@@ -487,7 +486,10 @@ async function finalizeDownload(filePath: string, mediaType: "image" | "video", 
       const inputPath = finalPath;
       finalPath = path.join(os.tmpdir(), `archive-video-${crypto.randomUUID()}.mp4`);
       console.log(`[video] transcoding input=${path.basename(inputPath)} output=${path.basename(finalPath)} target_bytes=${needsVideoCompression ? telegramVideoMaxBytes : "compatible"}`);
-      await transcodeForTelegram(inputPath, finalPath, needsVideoCompression ? telegramVideoMaxBytes : undefined);
+      await transcodeForTelegram(inputPath, finalPath, {
+        targetBytes: needsVideoCompression ? telegramVideoMaxBytes : undefined,
+        timeoutMs: env.PLATFORM_DOWNLOAD_TIMEOUT_MS,
+      });
       await fs.promises.rm(inputPath, { force: true }).catch(() => undefined);
     }
 
@@ -530,178 +532,6 @@ function isTelegramMp4(filePath: string, mimeType: string | undefined): boolean 
   return getExtension(filePath) === "mp4" || mimeType?.split(";")[0]?.trim().toLowerCase() === "video/mp4";
 }
 
-export function fitTelegramPhotoDimensions(width: number, height: number) {
-  let canvasWidth = width;
-  let canvasHeight = height;
-  if (width / height > 20) canvasHeight = Math.ceil(width / 20);
-  if (height / width > 20) canvasWidth = Math.ceil(height / 20);
-
-  const scale = Math.min(1, 9_999 / (canvasWidth + canvasHeight));
-  return {
-    contentWidth: Math.max(1, Math.floor(width * scale)),
-    contentHeight: Math.max(1, Math.floor(height * scale)),
-    canvasWidth: Math.max(1, Math.floor(canvasWidth * scale)),
-    canvasHeight: Math.max(1, Math.floor(canvasHeight * scale)),
-  };
-}
-
-async function normalizePhotoForTelegram(inputPath: string, mimeType: string | undefined): Promise<{ filePath: string; mimeType: string | undefined }> {
-  const { stdout } = await execFileAsync("magick", ["identify", "-format", "%w %h", `${inputPath}[0]`], { timeout: 10_000 });
-  const dimensions = stdout.trim().split(/\s+/);
-  const width = Number(dimensions[0]);
-  const height = Number(dimensions[1]);
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) throw new Error("ImageMagick returned invalid image dimensions");
-
-  const fitted = fitTelegramPhotoDimensions(width, height);
-  if (fitted.contentWidth === width && fitted.contentHeight === height && fitted.canvasWidth === width && fitted.canvasHeight === height) {
-    return { filePath: inputPath, mimeType };
-  }
-
-  const outputMimeType = mimeType?.split(";")[0]?.trim().toLowerCase() === "image/jpeg" ? "image/jpeg" : "image/png";
-  const outputPath = path.join(os.tmpdir(), `archive-image-${crypto.randomUUID()}.${outputMimeType === "image/jpeg" ? "jpg" : "png"}`);
-  const args = [inputPath, "-resize", `${fitted.contentWidth}x${fitted.contentHeight}!`];
-  if (fitted.contentWidth !== fitted.canvasWidth || fitted.contentHeight !== fitted.canvasHeight) {
-    args.push("-background", "white", "-gravity", "center", "-extent", `${fitted.canvasWidth}x${fitted.canvasHeight}`);
-  }
-  args.push(outputPath);
-  console.log(`[image] resizing for Telegram input=${width}x${height} output=${fitted.canvasWidth}x${fitted.canvasHeight}`);
-  try {
-    await runImageMagick(args);
-    return { filePath: outputPath, mimeType: outputMimeType };
-  } catch (error) {
-    await fs.promises.rm(outputPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function convertAnimatedWebpToMp4(inputPath: string, outputPath: string): Promise<void> {
-  try {
-    await runImageMagick([inputPath, "-coalesce", outputPath]);
-  } catch (error) {
-    await fs.promises.rm(outputPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function transcodeForTelegram(inputPath: string, outputPath: string, targetBytes?: number): Promise<void> {
-  try {
-    const baseArgs = [
-      "-hide_banner",
-      "-y",
-      "-i",
-      inputPath,
-      "-map",
-      "0:v:0",
-      "-sn",
-      "-dn",
-      "-vf",
-      "scale=trunc((iw*sar)/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-pix_fmt",
-      "yuv420p",
-      "-profile:v",
-      "main",
-    ];
-
-    if (targetBytes) {
-      const duration = await readVideoDuration(inputPath);
-      const audioBitrate = 128_000;
-      const videoBitrate = Math.max(100_000, Math.floor((targetBytes * 8 * 0.98) / duration) - audioBitrate);
-      const passDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "archive-ffmpeg-pass-"));
-      const passLog = path.join(passDir, "pass");
-      try {
-        await runFfmpeg([...baseArgs, "-b:v", String(videoBitrate), "-pass", "1", "-passlogfile", passLog, "-an", "-f", "mp4", os.devNull]);
-        await runFfmpeg([
-          ...baseArgs,
-          "-b:v",
-          String(videoBitrate),
-          "-pass",
-          "2",
-          "-passlogfile",
-          passLog,
-          "-map",
-          "0:a?",
-          "-c:a",
-          "aac",
-          "-b:a",
-          "128k",
-          "-movflags",
-          "+faststart",
-          outputPath,
-        ]);
-      } finally {
-        await fs.promises.rm(passDir, { force: true, recursive: true }).catch(() => undefined);
-      }
-      return;
-    }
-
-    await runFfmpeg([
-      ...baseArgs,
-      "-crf",
-      "28",
-      "-map",
-      "0:a?",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
-      "-movflags",
-      "+faststart",
-      outputPath,
-    ]);
-  } catch (error) {
-    await fs.promises.rm(outputPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function readVideoDuration(filePath: string): Promise<number> {
-  const { stdout } = await execFileAsync(
-    "ffprobe",
-    ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filePath],
-    { timeout: env.PLATFORM_DOWNLOAD_TIMEOUT_MS },
-  );
-  const duration = Number(stdout.trim());
-  if (!Number.isFinite(duration) || duration <= 0) throw new Error("ffprobe returned an invalid video duration");
-  return duration;
-}
-
-async function runImageMagick(args: string[]): Promise<void> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), env.PLATFORM_DOWNLOAD_TIMEOUT_MS);
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn("magick", args, {
-        stdio: ["ignore", "ignore", "pipe"],
-        signal: controller.signal,
-      });
-      const stderr: Buffer[] = [];
-
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderr.push(chunk);
-      });
-      child.on("error", reject);
-      child.on("close", (code, signal) => {
-        const message = Buffer.concat(stderr).toString("utf8").trim();
-        if (code === 0) {
-          resolve();
-          return;
-        }
-        reject(new Error(`magick failed${signal ? ` (${signal})` : ""}: ${message || `exit code ${code}`}`));
-      });
-    });
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error(`magick timed out after ${env.PLATFORM_DOWNLOAD_TIMEOUT_MS}ms`);
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function assertPlatformVideoFits(url: string, limit: number, formatSelector: string): Promise<void> {
   const metadata = JSON.parse(
     await runYtDlp([
@@ -717,39 +547,6 @@ async function assertPlatformVideoFits(url: string, limit: number, formatSelecto
   ) as PlatformMetadata;
 
   assertPlatformMetadataFits(metadata, limit, env.MAX_PLATFORM_VIDEO_SECONDS);
-}
-
-async function runFfmpeg(args: string[]): Promise<void> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), env.PLATFORM_DOWNLOAD_TIMEOUT_MS);
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn("ffmpeg", args, {
-        stdio: ["ignore", "ignore", "pipe"],
-        signal: controller.signal,
-      });
-      const stderr: Buffer[] = [];
-
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderr.push(chunk);
-      });
-      child.on("error", reject);
-      child.on("close", (code, signal) => {
-        const message = Buffer.concat(stderr).toString("utf8").trim();
-        if (code === 0) {
-          resolve();
-          return;
-        }
-        reject(new Error(`ffmpeg failed${signal ? ` (${signal})` : ""}: ${message || `exit code ${code}`}`));
-      });
-    });
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error(`ffmpeg timed out after ${env.PLATFORM_DOWNLOAD_TIMEOUT_MS}ms`);
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 async function runYtDlp(args: string[]): Promise<string> {

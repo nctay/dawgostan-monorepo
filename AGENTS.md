@@ -142,8 +142,8 @@ pnpm --filter worker typecheck
 pnpm --filter worker build
 ```
 
-If worker tests fail resolving `@archive/core`, build core first:
+If worker tests fail resolving a workspace package, build dependencies first:
 
 ```bash
-pnpm --filter @archive/core build
+pnpm turbo run build --filter=worker...
 ```

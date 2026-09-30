@@ -1,4 +1,4 @@
-import { getExtension, IMAGE_EXTENSIONS, maxBytesForMediaType, VIDEO_EXTENSIONS } from "@archive/core";
+import { getExtension, IMAGE_EXTENSIONS, maxBytesForMediaType, VIDEO_EXTENSIONS } from "@dawgostan/core";
 
 const apiBase = "https://cloud-api.yandex.net/v1/disk/public/resources";
 const allowedMimes: Record<string, string> = {

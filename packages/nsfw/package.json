@@ -1,5 +1,5 @@
 {
-  "name": "@dawgostan/core",
+  "name": "@dawgostan/nsfw",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,9 +16,6 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
-  },
-  "dependencies": {
-    "ipaddr.js": "^2.2.0"
   },
   "devDependencies": {
     "vitest": "^3.2.4"

@@ -30,7 +30,7 @@ jobs:
       - run: pnpm build
 
   deploy:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && vars.ENABLE_DEPLOY == 'true'
     needs: verify
     runs-on: ubuntu-latest
     env:

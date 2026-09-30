@@ -1,5 +1,5 @@
 import dns from "node:dns/promises";
-import { assertSafeResolvedAddress, assertSafeUrl, extractUrls, isSupportedMediaUrl, toUrl } from "@archive/core";
+import { assertSafeResolvedAddress, assertSafeUrl, extractUrls, isSupportedMediaUrl, toUrl } from "@dawgostan/core";
 import { env } from "../env.js";
 
 const shortLinkHosts = new Set(["clck.su", "www.clck.su", "bit.ly", "www.bit.ly", "tinyurl.com", "www.tinyurl.com", "clck.ru", "www.clck.ru"]);

@@ -57,14 +57,4 @@ describe("download failure cleanup", () => {
     expect(prismaMock.$transaction).toHaveBeenCalledOnce();
   });
 
-  it("fits oversized images within Telegram photo dimensions", async () => {
-    const { fitTelegramPhotoDimensions } = await import("./downloader.js");
-
-    const fitted = fitTelegramPhotoDimensions(8037, 7000);
-
-    expect(fitted.canvasWidth + fitted.canvasHeight).toBeLessThanOrEqual(10_000);
-    expect(Math.max(fitted.canvasWidth / fitted.canvasHeight, fitted.canvasHeight / fitted.canvasWidth)).toBeLessThanOrEqual(20);
-    expect(fitted.contentWidth).toBe(fitted.canvasWidth);
-    expect(fitted.contentHeight).toBe(fitted.canvasHeight);
-  });
 });

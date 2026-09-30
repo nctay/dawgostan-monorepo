@@ -9,6 +9,8 @@ COPY apps/bot/package.json apps/bot/package.json
 COPY apps/worker/package.json apps/worker/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/core/package.json packages/core/package.json
+COPY packages/media-processing/package.json packages/media-processing/package.json
+COPY packages/nsfw/package.json packages/nsfw/package.json
 RUN pnpm install --frozen-lockfile
 
 FROM deps AS build
@@ -16,7 +18,7 @@ COPY prisma prisma
 COPY packages packages
 COPY apps/worker apps/worker
 RUN pnpm db:generate
-RUN pnpm --filter @archive/core build
+RUN pnpm --filter @dawgostan/core --filter @dawgostan/media-processing --filter @dawgostan/nsfw build
 RUN pnpm --filter worker build
 
 FROM base AS runtime
@@ -34,4 +36,8 @@ COPY --from=build /app/apps/worker/dist ./apps/worker/dist
 COPY --from=build /app/packages/core/package.json ./packages/core/package.json
 COPY --from=build /app/packages/core/node_modules ./packages/core/node_modules
 COPY --from=build /app/packages/core/dist ./packages/core/dist
+COPY --from=build /app/packages/media-processing/package.json ./packages/media-processing/package.json
+COPY --from=build /app/packages/media-processing/dist ./packages/media-processing/dist
+COPY --from=build /app/packages/nsfw/package.json ./packages/nsfw/package.json
+COPY --from=build /app/packages/nsfw/dist ./packages/nsfw/dist
 CMD ["node", "apps/worker/dist/worker.js"]

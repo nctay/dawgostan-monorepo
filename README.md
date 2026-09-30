@@ -1,6 +1,24 @@
-# Twitch / w.tv Telegram Archive
+# Dawgostan Monorepo
 
 Telegram-only архиватор медиа из Twitch и w.tv чатов.
+
+## Структура
+
+- `apps/worker` — ingestion и оркестрация media pipeline.
+- `apps/bot` — Telegram admin/public bots.
+- `apps/nsfw-ensemble` — production NSFW inference service.
+- `apps/api`, `apps/web` — старые web/admin поверхности, сохранённые для совместимости.
+- `packages/core` — URL, network security и stream-session правила.
+- `packages/nsfw` — извлечение кадров и NSFW-классификация без зависимости от worker env.
+- `packages/media-processing` — Telegram-совместимая обработка и сжатие фото, GIF/WebP и видео.
+
+Сборка, проверки и кэш workspace-задач управляются Turborepo:
+
+```bash
+pnpm build
+pnpm typecheck
+pnpm test
+```
 
 Схема v1:
 
@@ -59,6 +77,8 @@ ALLOW_PRIVATE_MEDIA_HOSTS="false"
 ## VPS Deploy
 
 GitHub Actions workflow: `.github/workflows/deploy.yml`.
+
+Для нового репозитория deploy включается repository variable `ENABLE_DEPLOY=true`; до этого push запускает только проверки.
 
 На push в `main`/`master` он:
 

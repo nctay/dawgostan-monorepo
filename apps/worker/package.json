@@ -13,7 +13,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@archive/core": "workspace:*",
+    "@dawgostan/core": "workspace:*",
+    "@dawgostan/media-processing": "workspace:*",
+    "@dawgostan/nsfw": "workspace:*",
     "@prisma/client": "^6.10.1",
     "grammy": "^1.38.1",
     "tmi.js": "^1.8.5",

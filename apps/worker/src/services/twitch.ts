@@ -1,6 +1,6 @@
 import tmi from "tmi.js";
 import WebSocket from "ws";
-import { extractUrls, normalizeUrl } from "@archive/core";
+import { extractUrls, normalizeUrl } from "@dawgostan/core";
 import { prisma } from "../prisma.js";
 import { env, privateStreamerLogins } from "../env.js";
 import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, stripSkipTelegramPublicTag } from "./chat-filter.js";

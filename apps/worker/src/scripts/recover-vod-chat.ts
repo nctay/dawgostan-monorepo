@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { extractUrls, isSupportedMediaUrl, normalizeUrl } from "@archive/core";
+import { extractUrls, isSupportedMediaUrl, normalizeUrl } from "@dawgostan/core";
 import { env } from "../env.js";
 import { prisma } from "../prisma.js";
 import { isIgnoredChatAuthor, isIgnoredChatCommand } from "../services/chat-filter.js";

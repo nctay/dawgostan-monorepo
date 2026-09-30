@@ -1,4 +1,4 @@
-import { extractUrls } from "@archive/core";
+import { extractUrls } from "@dawgostan/core";
 import { prisma } from "../prisma.js";
 import { wtvChannels } from "../env.js";
 import { ingestChatMessage } from "./twitch.js";
