@@ -277,7 +277,7 @@ function deletedChannelCaption(metadata: DeletedChatMessageMetadata): string {
 }
 
 function hashtag(value: string): string {
-  return `#${value.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+  return `#${value.replace(/[^\p{L}\p{N}_]/gu, "_")}`;
 }
 
 function formatStreamDateTag(date: Date): string {

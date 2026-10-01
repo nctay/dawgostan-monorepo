@@ -143,4 +143,39 @@ describe("Telegram media spoilers", () => {
     );
     expect(apiMock.copyMessage).not.toHaveBeenCalled();
   });
+
+  it("keeps Unicode letters in the public sender hashtag", async () => {
+    apiMock.copyMessage.mockResolvedValue({ message_id: 2 });
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+
+    await publishStoredTelegramMedia(
+      {
+        id: "asset",
+        visibility: "public",
+        telegramChatId: "-100storage",
+        telegramMessageId: 1,
+        telegramFileId: "file",
+        telegramIsAnimation: false,
+        publicHasSpoiler: false,
+        mimeType: "image/jpeg",
+        mediaType: "image",
+        publicTelegramChatId: null,
+        publicTelegramMessageId: null,
+      },
+      {
+        streamerLogin: "streamer",
+        streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        authorName: "乃仨尸工丂",
+        messageText: "https://example.com/image.jpg",
+        skipTelegramPublic: false,
+      },
+    );
+
+    expect(apiMock.copyMessage).toHaveBeenCalledWith(
+      "-100public",
+      "-100storage",
+      1,
+      expect.objectContaining({ caption: expect.stringContaining("#user_乃仨尸工丂") }),
+    );
+  });
 });
