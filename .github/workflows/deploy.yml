@@ -35,9 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       APP_DIR: ${{ secrets.VPS_APP_DIR || '/srv/chat-meme-scraper' }}
-      BOT_IMAGE: ghcr.io/${{ github.repository_owner }}/chat-meme-scraper-bot:${{ github.sha }}
-      WORKER_IMAGE: ghcr.io/${{ github.repository_owner }}/chat-meme-scraper-worker:${{ github.sha }}
-      NSFW_ENSEMBLE_IMAGE: ghcr.io/${{ github.repository_owner }}/chat-meme-scraper-nsfw-ensemble:${{ github.sha }}
+      BOT_IMAGE: ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-bot:${{ github.sha }}
+      WORKER_IMAGE: ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-worker:${{ github.sha }}
+      NSFW_ENSEMBLE_IMAGE: ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-nsfw-ensemble:${{ github.sha }}
       GHCR_USERNAME: ${{ github.actor }}
       GHCR_TOKEN: ${{ github.token }}
       PROD_ENV_B64: ${{ secrets.PROD_ENV_B64 }}
@@ -60,7 +60,7 @@ jobs:
           push: true
           tags: |
             ${{ env.WORKER_IMAGE }}
-            ghcr.io/${{ github.repository_owner }}/chat-meme-scraper-worker:latest
+            ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-worker:latest
 
       - uses: docker/build-push-action@v6
         with:
@@ -69,7 +69,7 @@ jobs:
           push: true
           tags: |
             ${{ env.BOT_IMAGE }}
-            ghcr.io/${{ github.repository_owner }}/chat-meme-scraper-bot:latest
+            ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-bot:latest
 
       - uses: docker/build-push-action@v6
         with:
@@ -78,7 +78,7 @@ jobs:
           push: true
           tags: |
             ${{ env.NSFW_ENSEMBLE_IMAGE }}
-            ghcr.io/${{ github.repository_owner }}/chat-meme-scraper-nsfw-ensemble:latest
+            ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-nsfw-ensemble:latest
 
       - uses: appleboy/ssh-action@v1.2.0
         with:
