@@ -1,14 +1,13 @@
 # Dawgostan Monorepo
 
-Telegram-only архиватор медиа из Twitch и w.tv чатов.
+Telegram-first архиватор медиа из Twitch и w.tv чатов.
 
 ## Структура
 
 - `apps/worker` — ingestion и оркестрация media pipeline.
 - `apps/bot` — Telegram admin/public bots.
 - `apps/nsfw-ensemble` — production NSFW inference service.
-- `apps/api`, `apps/web` — старые web/admin поверхности, сохранённые для совместимости.
-- `packages/core` — URL, network security и stream-session правила.
+- `packages/core` — URL/media helpers и network security.
 - `packages/nsfw` — извлечение кадров и NSFW-классификация без зависимости от worker env.
 - `packages/media-processing` — Telegram-совместимая обработка и сжатие фото, GIF/WebP и видео.
 
@@ -19,6 +18,14 @@ pnpm build
 pnpm typecheck
 pnpm test
 ```
+
+## Документация
+
+- [`docs/README.md`](docs/README.md) — индекс и ключевые правила.
+- [`docs/architecture.md`](docs/architecture.md) — компоненты и модель данных.
+- [`docs/media-pipeline.md`](docs/media-pipeline.md) — путь сообщения от чата до Telegram.
+- [`docs/configuration.md`](docs/configuration.md) — env и GitHub secrets.
+- [`docs/operations.md`](docs/operations.md) — локальный запуск, deploy, VPS и recovery.
 
 Схема v1:
 
@@ -32,7 +39,7 @@ pnpm test
 pnpm install
 cp .env.example .env
 pnpm db:generate
-docker compose up -d postgres
+docker compose up -d postgres nsfw-ensemble
 docker compose run --rm worker pnpm db:migrate
 docker compose up --build worker bot
 ```
@@ -63,6 +70,8 @@ MAX_VIDEO_BYTES="104857600"
 MAX_DAILY_DOWNLOAD_BYTES="10737418240"
 MAX_PARALLEL_DOWNLOADS="2"
 ALLOW_PRIVATE_MEDIA_HOSTS="false"
+NSFW_ENSEMBLE_CLASSIFIER_URL="http://nsfw-ensemble:3333/classify"
+NSFW_ENSEMBLE_THRESHOLD="0.8"
 ```
 
 `WTV_CHANNELS` принимает ники или URL через запятую, например `kingkong_movie,mishamedvedka`.
@@ -85,7 +94,7 @@ GitHub Actions workflow: `.github/workflows/deploy.yml`.
 1. ставит зависимости;
 2. генерирует Prisma client;
 3. запускает typecheck/test/build;
-4. билдит `worker` и `bot` Docker images;
+4. билдит `worker`, `bot` и `nsfw-ensemble` Docker images;
 5. пушит images в GitHub Container Registry;
 6. заходит на VPS по SSH;
 7. копирует `docker-compose.prod.yml`;
@@ -102,8 +111,10 @@ GitHub Actions workflow: `.github/workflows/deploy.yml`.
 - `VPS_HOST`
 - `VPS_USER`
 - `VPS_SSH_KEY`
+- `VPS_ROOT_PASSWORD`, только для ручных диагностических/hardening workflow
 - `VPS_APP_DIR`, опционально, по умолчанию `/srv/chat-meme-scraper`
 - `PROD_ENV_B64`
+- `YOUTUBE_COOKIES_B64`, опционально
 
 Сгенерировать `PROD_ENV_B64`:
 

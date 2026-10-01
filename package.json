@@ -5,8 +5,6 @@
   "packageManager": "pnpm@10.12.1",
   "scripts": {
     "build": "turbo run build",
-    "dev": "pnpm --filter web dev",
-    "dev:api": "pnpm --filter api dev",
     "dev:worker": "pnpm --filter worker dev",
     "lint": "turbo run lint",
     "test": "turbo run test",
@@ -14,8 +12,7 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:dev": "prisma migrate dev",
-    "db:studio": "prisma studio",
-    "s3:local": "node scripts/init-local-s3.js"
+    "db:studio": "prisma studio"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -26,7 +23,6 @@
     "vitest": "^3.2.4"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1051.0",
     "@prisma/client": "6.19.3"
   }
 }

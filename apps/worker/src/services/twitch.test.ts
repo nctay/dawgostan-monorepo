@@ -12,7 +12,6 @@ const envMock = vi.hoisted(() => ({
   TWITCH_BOT_OAUTH: "oauth:test",
   TWITCH_CHANNELS: "streamer",
   WTV_CHANNELS: "",
-  WTV_COOKIE: undefined as string | undefined,
   TELEGRAM_BOT_TOKEN: "telegram-token",
   TELEGRAM_STORAGE_CHAT_ID: "-100storage",
   TELEGRAM_PUBLIC_CHANNEL_ID: undefined as string | undefined,

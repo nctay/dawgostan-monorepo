@@ -10,9 +10,8 @@ import { assertSafeResolvedAddress, assertSafeUrl, getExtension, isAnimatedWebp,
 import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegram } from "@dawgostan/media-processing";
 import { prisma } from "../prisma.js";
 import { env } from "../env.js";
-import { storeMedia } from "./storage.js";
 import { assertPlatformMetadataFits, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
-import { publishStoredTelegramMedia } from "./telegram-storage.js";
+import { publishStoredTelegramMedia, storeTelegramMedia } from "./telegram-storage.js";
 import { extractPostimageDirectImageUrl, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
@@ -87,7 +86,7 @@ async function processOneJob(): Promise<void> {
         console.log(
           `[nsfw] asset=${assetId} status=${moderation.status} owen=${moderation.owenScore?.toFixed(4) ?? "none"} siglip=${moderation.siglipScore?.toFixed(4) ?? "none"} public_spoiler=${moderation.publicSpoiler}`,
         );
-        const stored = await storeMedia(downloaded.filePath, downloaded.mimeType, downloaded.mediaType, {
+        const stored = await storeTelegramMedia(downloaded.filePath, downloaded.mimeType, downloaded.mediaType, {
           originalUrl: job.url,
           normalizedUrl,
           sha256: downloaded.sha256,
@@ -118,8 +117,6 @@ async function processOneJob(): Promise<void> {
             publicTelegramMessageId: null,
             publicHasSpoiler: moderation.publicSpoiler,
             telegramIsAnimation: Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif",
-            s3Key: stored.s3Key,
-            publicUrl: stored.publicUrl,
             mimeType: downloaded.mimeType,
             byteSize: downloaded.byteSize,
             mediaType: downloaded.mediaType,
@@ -135,8 +132,6 @@ async function processOneJob(): Promise<void> {
             telegramFileUniqueId: stored.telegramFileUniqueId,
             publicHasSpoiler: moderation.publicSpoiler,
             telegramIsAnimation: Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif",
-            s3Key: stored.s3Key,
-            publicUrl: stored.publicUrl,
             mimeType: downloaded.mimeType,
             byteSize: downloaded.byteSize,
             mediaType: downloaded.mediaType,

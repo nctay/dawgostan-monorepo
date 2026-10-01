@@ -25,39 +25,23 @@ services:
       - path: .env
         required: false
     environment:
-      NSFW_CLASSIFIER_URL: http://nsfw:3333/classify
-      NSFWJS_CLASSIFIER_URL: http://nsfwjs:3333/classify
-      NSFW_NUDE_THRESHOLD: "0.9"
-      NSFW_NIPPLES_THRESHOLD: "0.9"
-      NSFWJS_SPOILER_THRESHOLD: "0.9"
+      NSFW_ENSEMBLE_CLASSIFIER_URL: http://nsfw-ensemble:3333/classify
+      NSFW_ENSEMBLE_THRESHOLD: "0.8"
     depends_on:
       postgres:
         condition: service_healthy
-      nsfw:
-        condition: service_healthy
-      nsfwjs:
+      nsfw-ensemble:
         condition: service_healthy
 
-  nsfw:
+  nsfw-ensemble:
     build:
       context: .
-      dockerfile: apps/nsfw/Dockerfile
+      dockerfile: apps/nsfw-ensemble/Dockerfile
     restart: unless-stopped
-    cpus: 1
-    mem_limit: 1200m
+    cpus: 2
+    mem_limit: 2500m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3333/health', timeout=2).close()"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-
-  nsfwjs:
-    image: andresribeiroo/nsfwjs:3.1@sha256:7e8328d0c858efe1943b229c7aa08a3c9c9563b5f950572fe4ab752b067e1b95
-    restart: unless-stopped
-    cpus: 1
-    mem_limit: 512m
-    healthcheck:
-      test: ["CMD", "deno", "eval", "const r=await fetch('http://localhost:3333/');Deno.exit(r.status===404?0:1)"]
       interval: 10s
       timeout: 5s
       retries: 6

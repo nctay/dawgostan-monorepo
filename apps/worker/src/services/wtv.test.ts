@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const envMock = vi.hoisted(() => ({
   WTV_CHANNELS: "https://w.tv/kingkong_movie/,https://w.tv/mishamedvedka",
-  WTV_COOKIE: undefined as string | undefined,
 }));
 
 const prismaMock = vi.hoisted(() => ({

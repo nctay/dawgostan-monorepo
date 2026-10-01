@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { extractUrls, isAnimatedWebp, isPlatformMediaUrl, isSupportedMediaUrl, mediaTypeFromUrl, normalizeUrl } from "./media.js";
-import { shouldStartNewSession } from "./stream-sessions.js";
 
 describe("media helpers", () => {
   it("extracts common chat URLs", () => {
@@ -92,9 +91,5 @@ describe("media helpers", () => {
 
     expect(isAnimatedWebp(animated)).toBe(true);
     expect(isAnimatedWebp(still)).toBe(false);
-  });
-
-  it("splits sessions after two minutes", () => {
-    expect(shouldStartNewSession(new Date("2026-01-01T00:00:00Z"), new Date("2026-01-01T00:02:01Z"))).toBe(true);
   });
 });

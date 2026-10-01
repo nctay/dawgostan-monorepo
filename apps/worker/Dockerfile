@@ -4,10 +4,8 @@ RUN corepack enable
 
 FROM base AS deps
 COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml tsconfig.base.json ./
-COPY apps/api/package.json apps/api/package.json
 COPY apps/bot/package.json apps/bot/package.json
 COPY apps/worker/package.json apps/worker/package.json
-COPY apps/web/package.json apps/web/package.json
 COPY packages/core/package.json packages/core/package.json
 COPY packages/media-processing/package.json packages/media-processing/package.json
 COPY packages/nsfw/package.json packages/nsfw/package.json

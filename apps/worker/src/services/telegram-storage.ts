@@ -6,8 +6,7 @@ import type { Message } from "grammy/types";
 import { env, privateStreamerLogins } from "../env.js";
 import { prisma } from "../prisma.js";
 import { stripSkipTelegramPublicTag } from "./chat-filter.js";
-import type { PublicTelegramMediaMetadata, StoreMediaMetadata, StoredMedia } from "./storage.js";
-import { SerialRateLimiter, withTelegramRetry } from "./rate-limit.js";
+import { SerialRateLimiter } from "./rate-limit.js";
 
 let bot: Bot | null = null;
 const storageSendLimiter = new SerialRateLimiter(1100);
@@ -23,6 +22,31 @@ type TelegramStoredAsset = {
   mimeType: string | null;
   mediaType: string;
 };
+
+export type StoredMedia = {
+  storageProvider: "telegram";
+  telegramChatId: string;
+  telegramMessageId: number;
+  telegramFileId: string;
+  telegramFileUniqueId: string;
+};
+
+export type StoreMediaMetadata = {
+  originalUrl: string;
+  normalizedUrl: string;
+  sha256: string;
+  streamerLogin: string;
+  streamerDisplayName: string;
+  streamStartedAt: Date;
+  streamSessionId: string;
+  assetId: string;
+  authorName: string;
+  messageText: string;
+  skipTelegramPublic: boolean;
+  telegramSendAsAnimation?: boolean;
+};
+
+export type PublicTelegramMediaMetadata = Pick<StoreMediaMetadata, "streamerLogin" | "streamStartedAt" | "authorName" | "messageText" | "skipTelegramPublic">;
 
 function telegramBot(): Bot {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
@@ -96,11 +120,6 @@ export async function publishStoredTelegramMedia(
     where: { id: asset.id, publicTelegramMessageId: null },
     data: { publicTelegramChatId: copied.telegramChatId, publicTelegramMessageId: copied.telegramMessageId },
   });
-}
-
-export async function deleteTelegramMedia(asset: { telegramChatId: string | null; telegramMessageId: number | null }): Promise<void> {
-  if (!asset.telegramChatId || !asset.telegramMessageId) return;
-  await withTelegramRetry(() => telegramBot().api.deleteMessage(asset.telegramChatId!, asset.telegramMessageId!));
 }
 
 function fileName(filePath: string, mimeType: string, mediaType: "image" | "video"): string {
