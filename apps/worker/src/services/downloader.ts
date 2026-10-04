@@ -10,7 +10,7 @@ import { assertSafeResolvedAddress, assertSafeUrl, getExtension, isAnimatedWebp,
 import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegram } from "@dawgostan/media-processing";
 import { prisma } from "../prisma.js";
 import { env } from "../env.js";
-import { assertPlatformMetadataFits, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
+import { assertPlatformMetadataFits, PlatformDownloadRejectedError, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
 import { publishStoredTelegramMedia, storeTelegramMedia } from "./telegram-storage.js";
 import { extractPostimageDirectImageUrl, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
@@ -150,7 +150,8 @@ async function processOneJob(): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const currentAttempts = job.attempts;
-    const retry = currentAttempts < 3;
+    const rejected = error instanceof PlatformDownloadRejectedError;
+    const retry = !rejected && currentAttempts < 3;
     const jobUpdate = prisma.downloadJob.update({
       where: { id: job.id },
       data: {
@@ -175,7 +176,9 @@ async function processOneJob(): Promise<void> {
             data: { status: "failed" },
           }),
         ]));
-    console.error(`[download] failed job=${job.id} asset=${job.assetId ?? "none"} attempts=${currentAttempts} retry=${retry} error=${message}`);
+    const log = `[download] ${rejected ? "rejected" : "failed"} job=${job.id} asset=${job.assetId ?? "none"} attempts=${currentAttempts} retry=${retry} error=${message}`;
+    if (rejected) console.info(log);
+    else console.error(log);
   }
 }
 

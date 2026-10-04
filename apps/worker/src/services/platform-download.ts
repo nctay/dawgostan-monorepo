@@ -14,6 +14,13 @@ export type PlatformMetadata = {
 
 const platformAudioBudgetBytes = 10 * 1024 * 1024;
 
+export class PlatformDownloadRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlatformDownloadRejectedError";
+  }
+}
+
 export function platformFormatSelector(limitBytes: number): string {
   const audioBudget = Math.min(platformAudioBudgetBytes, Math.floor(limitBytes / 2));
   const videoBudget = limitBytes - audioBudget;
@@ -28,12 +35,12 @@ export function platformFormatSelector(limitBytes: number): string {
 
 export function assertPlatformMetadataFits(metadata: PlatformMetadata, limitBytes: number, maxDurationSeconds: number): void {
   if (typeof metadata.duration === "number" && metadata.duration > maxDurationSeconds) {
-    throw new Error(`Platform video is too long: ${metadata.duration}s > ${maxDurationSeconds}s`);
+    throw new PlatformDownloadRejectedError(`Platform video is too long: ${metadata.duration}s > ${maxDurationSeconds}s`);
   }
 
   const knownSize = bestKnownPlatformSize(metadata);
   if (knownSize && knownSize > limitBytes) {
-    throw new Error(`Platform video is too large before download: ${knownSize} > ${limitBytes}`);
+    throw new PlatformDownloadRejectedError(`Platform video is too large before download: ${knownSize} > ${limitBytes}`);
   }
 }
 

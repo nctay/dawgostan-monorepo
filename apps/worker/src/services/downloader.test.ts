@@ -88,6 +88,7 @@ describe("platform download lifecycle", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
     prismaMock.$queryRaw.mockResolvedValue([{ id: "job-1" }]);
     prismaMock.downloadJob.findUnique.mockResolvedValue({
       id: "job-1",
@@ -158,6 +159,40 @@ if (args.includes("--dump-json")) {
       await processDownloadQueue();
 
       expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+    } finally {
+      process.env.PATH = previousPath;
+      await fs.promises.rm(binDir, { force: true, recursive: true });
+    }
+  });
+
+  it("does not retry or error-log a platform video rejected by the duration limit", async () => {
+    const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-test-bin-"));
+    const ytDlpPath = path.join(binDir, "yt-dlp");
+    const previousPath = process.env.PATH;
+    await fs.promises.writeFile(
+      ytDlpPath,
+      `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ duration: 595, filesize: 13 }) + "\\n");
+`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+
+    try {
+      const { processDownloadQueue } = await import("./downloader.js");
+
+      await processDownloadQueue();
+
+      expect(prismaMock.downloadJob.update).toHaveBeenCalledWith({
+        where: { id: "job-1" },
+        data: {
+          status: "failed",
+          lastError: "Platform video is too long: 595s > 300s",
+          nextRetryAt: null,
+        },
+      });
+      expect(console.error).not.toHaveBeenCalled();
+      expect(console.info).toHaveBeenCalledWith(expect.stringContaining("[download] rejected"));
     } finally {
       process.env.PATH = previousPath;
       await fs.promises.rm(binDir, { force: true, recursive: true });
