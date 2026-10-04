@@ -13,7 +13,11 @@ The production v1 stack is:
 - private Telegram storage channel
 - optional public Telegram channel
 
-Old web/S3/MinIO/admin UI paths are not strategic for v1. Prefer Telegram bot/channel flows.
+For archive v1, old web/S3/MinIO/admin UI paths are not strategic. Prefer Telegram bot/channel flows.
+
+## Planned Contest Platform
+
+For contest, login, submissions, moderation, presentation, voting, public archive, or Bucket.ru work, read `docs/contest-platform/README.md`, then `docs/contest-platform/technical-design.md`; use `CONTEXT.md` terminology. This target is not implemented yet. Contest media deliberately uses Bucket.ru S3, while archive media remains in Telegram storage.
 
 ## User Intent
 
@@ -147,3 +151,17 @@ If worker tests fail resolving a workspace package, build dependencies first:
 ```bash
 pnpm turbo run build --filter=worker...
 ```
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context layout with root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.

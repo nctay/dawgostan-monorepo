@@ -26,6 +26,9 @@ pnpm test
 - [`docs/media-pipeline.md`](docs/media-pipeline.md) — путь сообщения от чата до Telegram.
 - [`docs/configuration.md`](docs/configuration.md) — env и GitHub secrets.
 - [`docs/operations.md`](docs/operations.md) — локальный запуск, deploy, VPS и recovery.
+- [`docs/contest-platform/README.md`](docs/contest-platform/README.md) — согласованная спецификация будущей Contest Platform.
+- [`docs/contest-platform/technical-design.md`](docs/contest-platform/technical-design.md) — Bucket.ru, переиспользование media pipeline и технические границы.
+- [`CONTEXT.md`](CONTEXT.md) — доменный словарь архива и конкурсной платформы.
 
 Схема v1:
 
