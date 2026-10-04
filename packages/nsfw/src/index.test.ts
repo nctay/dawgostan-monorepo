@@ -40,6 +40,46 @@ describe("NSFW classification", () => {
     }
   });
 
+  it("fast-seeks video frames instead of decoding the whole video until timeout", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dawgostan-nsfw-seek-test-"));
+    const video = path.join(directory, "video.mp4");
+    const binDir = path.join(directory, "bin");
+    const previousPath = process.env.PATH;
+    await fs.mkdir(binDir);
+    await fs.writeFile(video, "fixture");
+    await fs.writeFile(path.join(binDir, "ffprobe"), `#!/usr/bin/env node
+process.stdout.write("198.56\\n");
+`, { mode: 0o755 });
+    await fs.writeFile(path.join(binDir, "ffmpeg"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const seek = args.indexOf("-ss");
+const input = args.indexOf("-i");
+if (seek < 0 || seek > input) {
+  setTimeout(() => process.exit(1), 1000);
+} else {
+  fs.writeFileSync(args.at(-1), "frame");
+}
+`, { mode: 0o755 });
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ owen: 0.1, siglip: 0.2 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      expect(await classifyNsfw(video, "video", false, { ...config, requestTimeoutMs: 500 })).toEqual({
+        publicSpoiler: false,
+        owenScore: 0.1,
+        siglipScore: 0.2,
+        status: "ok",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+    } finally {
+      process.env.PATH = previousPath;
+      vi.unstubAllGlobals();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps video frame aspect ratio", () => {
     expect(frameFilters(8, 24, true)).toEqual(["fps=0.3333333333333333", "scale=224:224:force_original_aspect_ratio=decrease"]);
     expect(frameFilters(1, 0, true)).toEqual(["scale=224:224:force_original_aspect_ratio=decrease", "pad=224:224:(ow-iw)/2:(oh-ih)/2"]);

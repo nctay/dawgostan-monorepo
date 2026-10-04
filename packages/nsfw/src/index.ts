@@ -48,7 +48,7 @@ export async function classifyNsfw(
   const frameDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-nsfw-"));
   try {
     const maxFrames = framesToCheck(mediaType, animated, config.maxFrames);
-    const frames = await extractFrames(filePath, path.join(frameDir, "ensemble"), maxFrames, false, timeoutMs);
+    const frames = await extractFrames(filePath, path.join(frameDir, "ensemble"), maxFrames, false, timeoutMs, mediaType === "video");
     let highestOwen = 0;
     let highestSiglip = 0;
     for (const frame of frames) {
@@ -173,15 +173,27 @@ export function frameFilters(maxFrames: number, duration: number, nsfwjs: boolea
   ];
 }
 
-async function extractFrames(filePath: string, outputDir: string, maxFrames: number, nsfwjs: boolean, timeoutMs: number): Promise<string[]> {
+async function extractFrames(filePath: string, outputDir: string, maxFrames: number, nsfwjs: boolean, timeoutMs: number, fastSeek = false): Promise<string[]> {
   await fs.promises.mkdir(outputDir);
   const duration = maxFrames > 1 ? await readDuration(filePath, timeoutMs) : 0;
-  const output = path.join(outputDir, "frame-%02d.jpg");
-  await execFileAsync(
-    "ffmpeg",
-    ["-v", "error", "-i", filePath, "-vf", frameFilters(maxFrames, duration, nsfwjs).join(",") || "null", "-frames:v", String(maxFrames), "-q:v", nsfwjs ? "4" : "1", output],
-    { timeout: timeoutMs },
-  );
+  if (fastSeek && maxFrames > 1 && duration > 0) {
+    for (let index = 0; index < maxFrames; index += 1) {
+      const timestamp = (duration * index) / maxFrames;
+      const output = path.join(outputDir, `frame-${String(index + 1).padStart(2, "0")}.jpg`);
+      await execFileAsync(
+        "ffmpeg",
+        ["-v", "error", "-ss", String(timestamp), "-i", filePath, "-vf", frameFilters(1, 0, nsfwjs).join(",") || "null", "-frames:v", "1", "-q:v", nsfwjs ? "4" : "1", output],
+        { timeout: timeoutMs },
+      );
+    }
+  } else {
+    const output = path.join(outputDir, "frame-%02d.jpg");
+    await execFileAsync(
+      "ffmpeg",
+      ["-v", "error", "-i", filePath, "-vf", frameFilters(maxFrames, duration, nsfwjs).join(",") || "null", "-frames:v", String(maxFrames), "-q:v", nsfwjs ? "4" : "1", output],
+      { timeout: timeoutMs },
+    );
+  }
   const frames = (await fs.promises.readdir(outputDir))
     .filter((name) => name.endsWith(".jpg"))
     .sort()
