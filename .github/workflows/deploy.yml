@@ -63,6 +63,8 @@ jobs:
           context: .
           file: apps/worker/Dockerfile
           push: true
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
           tags: |
             ${{ env.WORKER_IMAGE }}
             ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-worker:latest
@@ -72,6 +74,8 @@ jobs:
           context: .
           file: apps/bot/Dockerfile
           push: true
+          cache-from: type=gha,scope=bot
+          cache-to: type=gha,mode=max,scope=bot
           tags: |
             ${{ env.BOT_IMAGE }}
             ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-bot:latest
@@ -81,6 +85,8 @@ jobs:
           context: .
           file: apps/nsfw-ensemble/Dockerfile
           push: true
+          cache-from: type=gha,scope=nsfw-ensemble
+          cache-to: type=gha,mode=max,scope=nsfw-ensemble
           tags: |
             ${{ env.NSFW_ENSEMBLE_IMAGE }}
             ghcr.io/${{ github.repository_owner }}/dawgostan-monorepo-nsfw-ensemble:latest
@@ -141,8 +147,10 @@ jobs:
               printf 'GRAFANA_CLOUD_LOKI_USER=%s\n' "$GRAFANA_CLOUD_LOKI_USER"
             } >> .env
             printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+            docker image prune -af
             docker compose -f docker-compose.prod.yml pull worker bot nsfw-ensemble alloy
             docker compose -f docker-compose.prod.yml up -d postgres
             docker compose -f docker-compose.prod.yml run --rm worker pnpm db:migrate
             docker compose -f docker-compose.prod.yml up -d --remove-orphans nsfw-ensemble worker bot alloy
             docker compose -f docker-compose.prod.yml ps
+            docker image prune -af
