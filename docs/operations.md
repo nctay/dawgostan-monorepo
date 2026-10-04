@@ -49,6 +49,17 @@ docker compose -f docker-compose.prod.yml run --rm worker pnpm db:migrate
 
 Не выполнять `down -v`, `docker volume rm`, удаление `postgres-data`, пересоздание PostgreSQL. `up -d` сохраняет volume.
 
+## Мониторинг
+
+Grafana Alloy отправляет в Grafana Cloud метрики VPS и Docker, а также логи `worker`, `bot`, `nsfw-ensemble` и PostgreSQL. Alloy UI наружу не публикуется.
+
+```bash
+docker compose -f docker-compose.prod.yml ps alloy
+docker compose -f docker-compose.prod.yml logs --tail=100 alloy
+```
+
+В Grafana Cloud установи integrations `Linux Server`, `Docker` и `Alloy Health`, чтобы получить готовые dashboards и базовые alerts.
+
 ## Backup PostgreSQL
 
 ```bash

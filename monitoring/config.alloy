@@ -1,0 +1,179 @@
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+local.file "grafana_cloud_token" {
+	filename  = "/run/secrets/grafana-cloud-token"
+	is_secret = true
+}
+
+prometheus.remote_write "metrics_service" {
+	endpoint {
+		url = sys.env("GRAFANA_CLOUD_PROMETHEUS_URL")
+
+		basic_auth {
+			username = sys.env("GRAFANA_CLOUD_PROMETHEUS_USER")
+			password = local.file.grafana_cloud_token.content
+		}
+	}
+}
+
+loki.write "grafana_cloud_loki" {
+	endpoint {
+		url = sys.env("GRAFANA_CLOUD_LOKI_URL")
+
+		basic_auth {
+			username = sys.env("GRAFANA_CLOUD_LOKI_USER")
+			password = local.file.grafana_cloud_token.content
+		}
+	}
+}
+
+prometheus.exporter.unix "integrations_node_exporter" {
+	rootfs_path = "/rootfs"
+	procfs_path = "/host/proc"
+	sysfs_path  = "/sys"
+
+	disable_collectors = ["ipvs", "btrfs", "infiniband", "xfs", "zfs"]
+
+	filesystem {
+		fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|tmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+		mount_points_exclude = "^/(dev|proc|run/credentials/.+|sys|var/lib/docker/.+)($|/)"
+		mount_timeout        = "5s"
+	}
+
+	netclass {
+		ignored_devices = "^(veth.*|cali.*|[a-f0-9]{15})$"
+	}
+
+	netdev {
+		device_exclude = "^(veth.*|cali.*|[a-f0-9]{15})$"
+	}
+}
+
+discovery.relabel "integrations_node_exporter" {
+	targets = prometheus.exporter.unix.integrations_node_exporter.targets
+
+	rule {
+		target_label = "instance"
+		replacement  = constants.hostname
+	}
+
+	rule {
+		target_label = "job"
+		replacement  = "integrations/node_exporter"
+	}
+}
+
+prometheus.scrape "integrations_node_exporter" {
+	scrape_interval = "30s"
+	targets         = discovery.relabel.integrations_node_exporter.output
+	forward_to      = [prometheus.remote_write.metrics_service.receiver]
+}
+
+prometheus.exporter.cadvisor "integrations_cadvisor" {
+	docker_host = "unix:///var/run/docker.sock"
+	docker_only = true
+
+	storage_duration = "5m"
+
+	store_container_labels       = false
+	allowlisted_container_labels = ["com.docker.compose.project", "com.docker.compose.service"]
+}
+
+discovery.relabel "integrations_cadvisor" {
+	targets = prometheus.exporter.cadvisor.integrations_cadvisor.targets
+
+	rule {
+		target_label = "job"
+		replacement  = "integrations/docker"
+	}
+
+	rule {
+		target_label = "instance"
+		replacement  = constants.hostname
+	}
+}
+
+prometheus.scrape "integrations_cadvisor" {
+	scrape_interval = "30s"
+	targets         = discovery.relabel.integrations_cadvisor.output
+	forward_to      = [prometheus.remote_write.metrics_service.receiver]
+}
+
+prometheus.exporter.self "integrations_alloy_health" { }
+
+discovery.relabel "integrations_alloy_health" {
+	targets = prometheus.exporter.self.integrations_alloy_health.targets
+
+	rule {
+		target_label = "job"
+		replacement  = "integrations/alloy"
+	}
+
+	rule {
+		target_label = "instance"
+		replacement  = constants.hostname
+	}
+}
+
+prometheus.scrape "integrations_alloy_health" {
+	scrape_interval = "30s"
+	targets         = discovery.relabel.integrations_alloy_health.output
+	forward_to      = [prometheus.remote_write.metrics_service.receiver]
+}
+
+discovery.docker "logs_integrations_docker" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "5s"
+}
+
+discovery.relabel "logs_integrations_docker" {
+	targets = []
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		regex         = "(postgres|worker|nsfw-ensemble|bot)"
+		action        = "keep"
+	}
+
+	rule {
+		target_label = "job"
+		replacement  = "integrations/docker"
+	}
+
+	rule {
+		target_label = "instance"
+		replacement  = constants.hostname
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service_name"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_log_stream"]
+		target_label  = "stream"
+	}
+
+	rule {
+		target_label = "environment"
+		replacement  = "production"
+	}
+}
+
+loki.source.docker "logs_integrations_docker" {
+	host             = "unix:///var/run/docker.sock"
+	targets          = discovery.docker.logs_integrations_docker.targets
+	relabel_rules    = discovery.relabel.logs_integrations_docker.rules
+	refresh_interval = "5s"
+	forward_to       = [loki.write.grafana_cloud_loki.receiver]
+}

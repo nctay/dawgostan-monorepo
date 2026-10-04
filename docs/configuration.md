@@ -60,9 +60,19 @@ Secrets:
 
 - `PROD_ENV_B64` — base64 production `.env`;
 - `YOUTUBE_COOKIES_B64` — опциональные cookies;
+- `GRAFANA_CLOUD_TOKEN` — stack access-policy token только с `metrics:write` и `logs:write`;
 - `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` — deploy SSH;
 - `VPS_APP_DIR` — опционально, default `/srv/chat-meme-scraper`;
 - `VPS_ROOT_PASSWORD` — только ручные root workflows.
+
+Grafana Cloud repository variables:
+
+- `GRAFANA_CLOUD_PROMETHEUS_URL`;
+- `GRAFANA_CLOUD_PROMETHEUS_USER`;
+- `GRAFANA_CLOUD_LOKI_URL`;
+- `GRAFANA_CLOUD_LOKI_USER`.
+
+Deploy хранит Grafana token на VPS в `private/grafana-cloud-token`; в `.env` и Docker environment он не записывается.
 
 Секреты перенесены server-side; проверять имена, не значения.
 

@@ -42,6 +42,11 @@ jobs:
       GHCR_TOKEN: ${{ github.token }}
       PROD_ENV_B64: ${{ secrets.PROD_ENV_B64 }}
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+      GRAFANA_CLOUD_TOKEN: ${{ secrets.GRAFANA_CLOUD_TOKEN }}
+      GRAFANA_CLOUD_PROMETHEUS_URL: ${{ vars.GRAFANA_CLOUD_PROMETHEUS_URL }}
+      GRAFANA_CLOUD_PROMETHEUS_USER: ${{ vars.GRAFANA_CLOUD_PROMETHEUS_USER }}
+      GRAFANA_CLOUD_LOKI_URL: ${{ vars.GRAFANA_CLOUD_LOKI_URL }}
+      GRAFANA_CLOUD_LOKI_USER: ${{ vars.GRAFANA_CLOUD_LOKI_USER }}
     steps:
       - uses: actions/checkout@v4
 
@@ -90,6 +95,7 @@ jobs:
             set -e
             mkdir -p "$APP_DIR"
             mkdir -p "$APP_DIR/private"
+            mkdir -p "$APP_DIR/monitoring"
             chmod 700 "$APP_DIR/private"
 
       - uses: appleboy/scp-action@v0.1.7
@@ -97,7 +103,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: docker-compose.prod.yml
+          source: docker-compose.prod.yml,monitoring/config.alloy
           target: ${{ secrets.VPS_APP_DIR || '/srv/chat-meme-scraper' }}
 
       - uses: appleboy/ssh-action@v1.2.0
@@ -105,25 +111,38 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: APP_DIR,PROD_ENV_B64,YOUTUBE_COOKIES_B64,BOT_IMAGE,WORKER_IMAGE,NSFW_ENSEMBLE_IMAGE,GHCR_USERNAME,GHCR_TOKEN
+          envs: APP_DIR,PROD_ENV_B64,YOUTUBE_COOKIES_B64,BOT_IMAGE,WORKER_IMAGE,NSFW_ENSEMBLE_IMAGE,GHCR_USERNAME,GHCR_TOKEN,GRAFANA_CLOUD_TOKEN,GRAFANA_CLOUD_PROMETHEUS_URL,GRAFANA_CLOUD_PROMETHEUS_USER,GRAFANA_CLOUD_LOKI_URL,GRAFANA_CLOUD_LOKI_USER
           script: |
-            set -e
+            set -eu
             cd "$APP_DIR"
+            test -n "$GRAFANA_CLOUD_TOKEN"
+            test -n "$GRAFANA_CLOUD_PROMETHEUS_URL"
+            test -n "$GRAFANA_CLOUD_PROMETHEUS_USER"
+            test -n "$GRAFANA_CLOUD_LOKI_URL"
+            test -n "$GRAFANA_CLOUD_LOKI_USER"
             if [ -n "$YOUTUBE_COOKIES_B64" ]; then
               umask 077
               printf '%s' "$YOUTUBE_COOKIES_B64" | base64 -d > private/youtube-cookies.txt.tmp
               test -s private/youtube-cookies.txt.tmp
               mv private/youtube-cookies.txt.tmp private/youtube-cookies.txt
             fi
+            umask 077
+            printf '%s' "$GRAFANA_CLOUD_TOKEN" > private/grafana-cloud-token.tmp
+            test -s private/grafana-cloud-token.tmp
+            mv private/grafana-cloud-token.tmp private/grafana-cloud-token
             printf '%s' "$PROD_ENV_B64" | base64 -d > .env
             {
-              echo "BOT_IMAGE=$BOT_IMAGE"
-              echo "WORKER_IMAGE=$WORKER_IMAGE"
-              echo "NSFW_ENSEMBLE_IMAGE=$NSFW_ENSEMBLE_IMAGE"
+              printf 'BOT_IMAGE=%s\n' "$BOT_IMAGE"
+              printf 'WORKER_IMAGE=%s\n' "$WORKER_IMAGE"
+              printf 'NSFW_ENSEMBLE_IMAGE=%s\n' "$NSFW_ENSEMBLE_IMAGE"
+              printf 'GRAFANA_CLOUD_PROMETHEUS_URL=%s\n' "$GRAFANA_CLOUD_PROMETHEUS_URL"
+              printf 'GRAFANA_CLOUD_PROMETHEUS_USER=%s\n' "$GRAFANA_CLOUD_PROMETHEUS_USER"
+              printf 'GRAFANA_CLOUD_LOKI_URL=%s\n' "$GRAFANA_CLOUD_LOKI_URL"
+              printf 'GRAFANA_CLOUD_LOKI_USER=%s\n' "$GRAFANA_CLOUD_LOKI_USER"
             } >> .env
             printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
-            docker compose -f docker-compose.prod.yml pull worker bot nsfw-ensemble
+            docker compose -f docker-compose.prod.yml pull worker bot nsfw-ensemble alloy
             docker compose -f docker-compose.prod.yml up -d postgres
             docker compose -f docker-compose.prod.yml run --rm worker pnpm db:migrate
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans nsfw-ensemble worker bot
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans nsfw-ensemble worker bot alloy
             docker compose -f docker-compose.prod.yml ps

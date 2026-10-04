@@ -53,5 +53,33 @@ services:
       postgres:
         condition: service_healthy
 
+  alloy:
+    image: grafana/alloy:v1.20.1
+    restart: unless-stopped
+    privileged: true
+    cpus: 0.5
+    mem_limit: 512m
+    environment:
+      GRAFANA_CLOUD_PROMETHEUS_URL: ${GRAFANA_CLOUD_PROMETHEUS_URL:?GRAFANA_CLOUD_PROMETHEUS_URL is required}
+      GRAFANA_CLOUD_PROMETHEUS_USER: ${GRAFANA_CLOUD_PROMETHEUS_USER:?GRAFANA_CLOUD_PROMETHEUS_USER is required}
+      GRAFANA_CLOUD_LOKI_URL: ${GRAFANA_CLOUD_LOKI_URL:?GRAFANA_CLOUD_LOKI_URL is required}
+      GRAFANA_CLOUD_LOKI_USER: ${GRAFANA_CLOUD_LOKI_USER:?GRAFANA_CLOUD_LOKI_USER is required}
+    volumes:
+      - ./monitoring/config.alloy:/etc/alloy/config.alloy:ro
+      - ./private/grafana-cloud-token:/run/secrets/grafana-cloud-token:ro
+      - alloy-data:/var/lib/alloy/data
+      - /:/rootfs:ro
+      - /proc:/host/proc:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    command:
+      - run
+      - --server.http.listen-addr=127.0.0.1:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+
 volumes:
   postgres-data:
+  alloy-data:
