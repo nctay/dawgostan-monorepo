@@ -35,7 +35,7 @@ pnpm --filter worker build
 
 `.github/workflows/deploy.yml` работает на push/PR в `main`/`master`. Verify: frozen install, Prisma generate, typecheck, tests, build. Deploy только на push при `ENABLE_DEPLOY=true`: публикует `worker`, `bot`, `nsfw-ensemble` в GHCR, копирует compose, восстанавливает env/cookies, применяет migrations, запускает `up -d --remove-orphans`.
 
-Docker BuildKit cache хранится в GitHub Actions отдельно для каждого образа. Перед скачиванием новых образов и после успешного запуска deploy удаляет только неиспользуемые Docker-образы; запущенные контейнеры и volumes, включая PostgreSQL, не затрагиваются.
+Docker BuildKit cache хранится в GitHub Actions отдельно для каждого образа. Перед скачиванием новых образов deploy удаляет только неиспользуемые Docker-образы; запущенные контейнеры и volumes, включая PostgreSQL, не затрагиваются.
 
 При включённом deploy любой main push, включая docs-only, запускает production rollout.
 
