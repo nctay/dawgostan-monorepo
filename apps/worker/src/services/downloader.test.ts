@@ -1,19 +1,44 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const prismaMock = vi.hoisted(() => ({
   $queryRaw: vi.fn(),
   $transaction: vi.fn(),
-  downloadJob: { findUnique: vi.fn(), update: vi.fn() },
-  chatPost: { updateMany: vi.fn() },
-  asset: { updateMany: vi.fn() },
+  blockedMedia: { findUnique: vi.fn() },
+  downloadJob: { findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
+  chatPost: { findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
+  asset: { aggregate: vi.fn(), findUnique: vi.fn(), updateMany: vi.fn(), upsert: vi.fn() },
 }));
+const classifyNsfwMock = vi.hoisted(() => vi.fn());
+const publishStoredTelegramMediaMock = vi.hoisted(() => vi.fn());
+const storeTelegramMediaMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../env.js", () => ({
-  env: { MAX_PARALLEL_DOWNLOADS: 1 },
+  env: {
+    ALLOW_PRIVATE_MEDIA_HOSTS: false,
+    ENABLE_PLATFORM_DOWNLOADS: true,
+    MAX_DAILY_DOWNLOAD_BYTES: 10_000_000,
+    MAX_IMAGE_BYTES: 1_000_000,
+    MAX_PARALLEL_DOWNLOADS: 1,
+    MAX_PLATFORM_VIDEO_SECONDS: 300,
+    MAX_VIDEO_BYTES: 1_000_000,
+    PLATFORM_DOWNLOAD_TIMEOUT_MS: 10_000,
+  },
 }));
 
 vi.mock("../prisma.js", () => ({
   prisma: prismaMock,
+}));
+
+vi.mock("./nsfw.js", () => ({
+  classifyNsfw: classifyNsfwMock,
+}));
+
+vi.mock("./telegram-storage.js", () => ({
+  publishStoredTelegramMedia: publishStoredTelegramMediaMock,
+  storeTelegramMedia: storeTelegramMediaMock,
 }));
 
 describe("download failure cleanup", () => {
@@ -57,4 +82,85 @@ describe("download failure cleanup", () => {
     expect(prismaMock.$transaction).toHaveBeenCalledOnce();
   });
 
+});
+
+describe("platform download lifecycle", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    prismaMock.$queryRaw.mockResolvedValue([{ id: "job-1" }]);
+    prismaMock.downloadJob.findUnique.mockResolvedValue({
+      id: "job-1",
+      assetId: "asset-1",
+      chatPostId: "post-1",
+      url: "https://clips.twitch.tv/FixtureClip",
+      attempts: 1,
+      chatPost: {
+        normalizedUrl: "https://clips.twitch.tv/FixtureClip",
+        authorName: "viewer",
+        messageText: "https://clips.twitch.tv/FixtureClip",
+        skipTelegramPublic: false,
+        streamSession: {
+          id: "session-1",
+          startedAt: new Date("2026-10-03T17:00:00Z"),
+          streamer: { login: "streamer", displayName: "Streamer" },
+        },
+      },
+    });
+    prismaMock.blockedMedia.findUnique.mockResolvedValue(null);
+    prismaMock.asset.findUnique.mockResolvedValue(null);
+    prismaMock.chatPost.findFirst.mockResolvedValue(null);
+    prismaMock.asset.aggregate.mockResolvedValue({ _sum: { byteSize: 0n } });
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-1" });
+    prismaMock.downloadJob.update.mockResolvedValue({});
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 0 });
+    prismaMock.chatPost.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.asset.updateMany.mockResolvedValue({ count: 0 });
+    prismaMock.$transaction.mockResolvedValue([]);
+    classifyNsfwMock.mockImplementation(async (filePath: string) => {
+      await fs.promises.access(filePath, fs.constants.R_OK);
+      return { publicSpoiler: false, status: "ok" };
+    });
+    storeTelegramMediaMock.mockResolvedValue({
+      storageProvider: "telegram",
+      telegramChatId: "-100storage",
+      telegramMessageId: 1,
+      telegramFileId: "file",
+      telegramFileUniqueId: "unique",
+    });
+    publishStoredTelegramMediaMock.mockResolvedValue(undefined);
+  });
+
+  it("keeps a compatible platform video readable until storage completes", async () => {
+    const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-test-bin-"));
+    const ytDlpPath = path.join(binDir, "yt-dlp");
+    const previousPath = process.env.PATH;
+    await fs.promises.writeFile(
+      ytDlpPath,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("--dump-json")) {
+  process.stdout.write(JSON.stringify({ duration: 10, filesize: 13 }) + "\\n");
+} else {
+  const template = args[args.indexOf("--output") + 1];
+  const output = template.replace("%(id)s", "fixture").replace("%(ext)s", "mp4");
+  fs.writeFileSync(output, "fixture-video");
+}
+`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+
+    try {
+      const { processDownloadQueue } = await import("./downloader.js");
+
+      await processDownloadQueue();
+
+      expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+    } finally {
+      process.env.PATH = previousPath;
+      await fs.promises.rm(binDir, { force: true, recursive: true });
+    }
+  });
 });

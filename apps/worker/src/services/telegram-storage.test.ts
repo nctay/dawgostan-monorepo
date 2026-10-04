@@ -1,13 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({ sendPhoto: vi.fn(), sendVideo: vi.fn(), sendAnimation: vi.fn(), copyMessage: vi.fn() }));
+const inputFileMock = vi.hoisted(() => vi.fn());
 const prismaMock = vi.hoisted(() => ({ asset: { updateMany: vi.fn() } }));
 
 vi.mock("grammy", () => ({
   Bot: class {
     api = apiMock;
   },
-  InputFile: class {},
+  InputFile: class {
+    constructor(...args: unknown[]) {
+      inputFileMock(...args);
+    }
+  },
 }));
 
 vi.mock("../env.js", () => ({
@@ -54,6 +59,26 @@ describe("Telegram media spoilers", () => {
     });
 
     expect(apiMock.sendPhoto.mock.calls[0]?.[2]).not.toHaveProperty("has_spoiler");
+  });
+
+  it("lets grammY open the media file when the request is sent", async () => {
+    const { storeTelegramMedia } = await import("./telegram-storage.js");
+
+    await storeTelegramMedia("/dev/null", "image/jpeg", "image", {
+      originalUrl: "https://example.com/image.jpg",
+      normalizedUrl: "https://example.com/image.jpg",
+      sha256: "hash",
+      streamerLogin: "streamer",
+      streamerDisplayName: "Streamer",
+      streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+      streamSessionId: "session",
+      assetId: "asset",
+      authorName: "Viewer",
+      messageText: "https://example.com/image.jpg",
+      skipTelegramPublic: false,
+    });
+
+    expect(inputFileMock).toHaveBeenCalledWith("/dev/null", "null.jpeg");
   });
 
   it("accepts a GIF that Telegram stored as a document", async () => {

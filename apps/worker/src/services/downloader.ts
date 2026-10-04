@@ -428,11 +428,22 @@ async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {
 
     const downloadedPath = await findDownloadedPlatformFile(tempDir);
     const result = await finalizeDownload(downloadedPath, "video", url.toString(), limit);
+    const retainedPath = await retainPlatformDownload(result.filePath, tempDir);
     console.log(`[platform] downloaded url=${url.toString()} bytes=${result.byteSize} mime=${result.mimeType}`);
-    return result;
+    return { ...result, filePath: retainedPath };
   } finally {
     await fs.promises.rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
   }
+}
+
+async function retainPlatformDownload(filePath: string, tempDir: string): Promise<string> {
+  const relativePath = path.relative(tempDir, filePath);
+  const isInsideTempDir = relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath);
+  if (!isInsideTempDir) return filePath;
+
+  const retainedPath = path.join(os.tmpdir(), `archive-video-${crypto.randomUUID()}${path.extname(filePath) || ".mp4"}`);
+  await fs.promises.rename(filePath, retainedPath);
+  return retainedPath;
 }
 
 async function finalizeDownload(filePath: string, mediaType: "image" | "video", finalUrl: string, limit: number, originalMimeType?: string): Promise<DownloadResult> {

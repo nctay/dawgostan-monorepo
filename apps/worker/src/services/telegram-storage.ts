@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { Bot, InputFile } from "grammy";
@@ -65,7 +64,7 @@ export async function storeTelegramMedia(filePath: string, mimeType: string, med
     metadata.normalizedUrl,
   ].join("\n");
 
-  const input = new InputFile(fs.createReadStream(filePath), fileName(filePath, mimeType, mediaType));
+  const input = new InputFile(filePath, fileName(filePath, mimeType, mediaType));
   const videoMetadata = mediaType === "video" ? await readVideoMetadata(filePath) : {};
   const message = await storageSendLimiter.schedule<Message.PhotoMessage | Message.VideoMessage | Message.AnimationMessage>(async () => {
     if (isGif(mimeType) || metadata.telegramSendAsAnimation) {
