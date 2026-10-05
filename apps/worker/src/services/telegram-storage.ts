@@ -11,11 +11,14 @@ let bot: Bot | null = null;
 const storageSendLimiter = new SerialRateLimiter(1100);
 const publicChannelSendLimiter = new SerialRateLimiter(1100);
 const deletedChannelSendLimiter = new SerialRateLimiter(1100);
+export const telegramMediaGroupMaxItems = 10;
 
 type TelegramStoredAsset = {
   telegramChatId: string | null;
   telegramMessageId: number | null;
+  telegramMessageIds?: number[];
   telegramFileId: string | null;
+  telegramFileIds?: string[];
   telegramIsAnimation: boolean;
   publicHasSpoiler: boolean;
   mimeType: string | null;
@@ -26,7 +29,9 @@ export type StoredMedia = {
   storageProvider: "telegram";
   telegramChatId: string;
   telegramMessageId: number;
+  telegramMessageIds: number[];
   telegramFileId: string;
+  telegramFileIds: string[];
   telegramFileUniqueId: string;
 };
 
@@ -92,8 +97,47 @@ export async function storeTelegramMedia(filePath: string, mimeType: string, med
     storageProvider: "telegram",
     telegramChatId: String(message.chat.id),
     telegramMessageId: message.message_id,
+    telegramMessageIds: [message.message_id],
     telegramFileId: file.file_id,
+    telegramFileIds: [file.file_id],
     telegramFileUniqueId: file.file_unique_id,
+  };
+}
+
+export async function storeTelegramMediaGroup(files: Array<{ filePath: string; mimeType: string }>, metadata: StoreMediaMetadata): Promise<StoredMedia> {
+  if (!env.TELEGRAM_STORAGE_CHAT_ID) throw new Error("TELEGRAM_STORAGE_CHAT_ID is not configured");
+  if (files.length < 2) throw new Error("Telegram media group requires at least two files");
+  if (files.length > telegramMediaGroupMaxItems) throw new Error(`Telegram media group supports at most ${telegramMediaGroupMaxItems} files`);
+
+  const caption = [
+    `streamer=${metadata.streamerLogin}`,
+    `session=${metadata.streamSessionId}`,
+    `asset=${metadata.assetId}`,
+    `sha256=${metadata.sha256}`,
+    metadata.normalizedUrl,
+  ].join("\n");
+  const messages = (await storageSendLimiter.schedule(() =>
+    telegramBot().api.sendMediaGroup(
+      env.TELEGRAM_STORAGE_CHAT_ID!,
+      files.map((file, index) => ({
+        type: "photo" as const,
+        media: new InputFile(file.filePath, fileName(file.filePath, file.mimeType, "image")),
+        ...(index === 0 ? { caption } : {}),
+      })),
+    ),
+  )) as Message.PhotoMessage[];
+
+  const storedFiles = messages.map((message) => message.photo.at(-1)).filter((file): file is NonNullable<typeof file> => Boolean(file));
+  if (messages.length !== files.length || storedFiles.length !== files.length) throw new Error("Telegram did not return all album file metadata");
+
+  return {
+    storageProvider: "telegram",
+    telegramChatId: String(messages[0]!.chat.id),
+    telegramMessageId: messages[0]!.message_id,
+    telegramMessageIds: messages.map((message) => message.message_id),
+    telegramFileId: storedFiles[0]!.file_id,
+    telegramFileIds: storedFiles.map((file) => file.file_id),
+    telegramFileUniqueId: storedFiles[0]!.file_unique_id,
   };
 }
 
@@ -198,6 +242,21 @@ async function publishTelegramMedia(asset: TelegramStoredAsset, metadata: Public
 }
 
 async function sendStoredTelegramMedia(chatId: string, asset: TelegramStoredAsset, caption: string): Promise<{ message_id: number }> {
+  const albumFileIds = asset.telegramFileIds ?? [];
+  if (albumFileIds.length > 1) {
+    if (albumFileIds.length > telegramMediaGroupMaxItems) throw new Error(`Telegram media group supports at most ${telegramMediaGroupMaxItems} files`);
+    const messages = await telegramBot().api.sendMediaGroup(
+      chatId,
+      albumFileIds.map((fileId, index) => ({
+        type: "photo" as const,
+        media: fileId,
+        ...(index === 0 ? { caption } : {}),
+        ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}),
+      })),
+    );
+    if (!messages[0]) throw new Error("Telegram did not return a public album message");
+    return { message_id: messages[0].message_id };
+  }
   if (!asset.publicHasSpoiler) {
     return telegramBot().api.copyMessage(chatId, asset.telegramChatId!, asset.telegramMessageId!, { caption });
   }

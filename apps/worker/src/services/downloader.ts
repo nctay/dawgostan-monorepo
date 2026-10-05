@@ -11,8 +11,8 @@ import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegr
 import { prisma } from "../prisma.js";
 import { env } from "../env.js";
 import { assertPlatformMetadataFits, PlatformDownloadRejectedError, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
-import { publishStoredTelegramMedia, storeTelegramMedia } from "./telegram-storage.js";
-import { extractPostimageDirectImageUrl, isResolvableMediaPageUrl } from "./media-page-resolver.js";
+import { publishStoredTelegramMedia, storeTelegramMedia, storeTelegramMediaGroup, telegramMediaGroupMaxItems } from "./telegram-storage.js";
+import { extractMediaPageUrls, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
 
@@ -29,6 +29,8 @@ type DownloadResult = {
 const shaLocks = new Map<string, Promise<void>>();
 const youtubeCookiesFile = "/run/private/youtube-cookies.txt";
 const telegramVideoMaxBytes = 49_900_000;
+
+class MediaDownloadRejectedError extends Error {}
 
 export async function processDownloadQueue(): Promise<void> {
   const slots = Math.max(1, env.MAX_PARALLEL_DOWNLOADS);
@@ -60,17 +62,25 @@ async function processOneJob(): Promise<void> {
     }
 
     await assertDailyLimitAvailable();
-    const downloaded = await downloadMedia(job.url);
-
+    const downloads = await downloadMedia(job.url);
     try {
-      await withShaLock(downloaded.sha256, async () => {
-        const blockedByHash = await prisma.blockedMedia.findUnique({ where: { sha256: downloaded.sha256 } });
+      const downloaded = downloads[0]!;
+      const sha256 = downloads.length === 1 ? downloaded.sha256 : crypto.createHash("sha256").update(downloads.map((item) => item.sha256).join("\n")).digest("hex");
+      const sha256s = downloads.map((item) => item.sha256);
+      const byteSize = downloads.reduce((total, item) => total + item.byteSize, 0);
+
+      await withShaLock(sha256, async () => {
+        let blockedByHash = null;
+        for (const hash of new Set([sha256, ...downloads.map((item) => item.sha256)])) {
+          blockedByHash = await prisma.blockedMedia.findUnique({ where: { sha256: hash } });
+          if (blockedByHash) break;
+        }
         if (blockedByHash) {
           await markBlocked(job.id, job.chatPostId, "SHA-256 is blocked");
           return;
         }
 
-        const existingByHash = await prisma.asset.findUnique({ where: { sha256: downloaded.sha256 } });
+        const existingByHash = await prisma.asset.findUnique({ where: { sha256 } });
         if (existingByHash?.status === "stored") {
           await markStoredReferences(existingByHash.id, normalizedUrl, job.id, job.chatPostId, existingByUrl?.id ?? job.assetId);
           await publishStoredTelegramMedia(existingByHash, publicMetadata(job));
@@ -78,18 +88,22 @@ async function processOneJob(): Promise<void> {
         }
 
         const assetId = existingByUrl?.id ?? crypto.randomUUID();
-        const moderation = await classifyNsfw(
-          downloaded.filePath,
-          downloaded.mediaType,
-          downloaded.mediaType === "video" || downloaded.mimeType === "image/gif" || Boolean(downloaded.telegramSendAsAnimation),
-        );
-        console.log(
-          `[nsfw] asset=${assetId} status=${moderation.status} owen=${moderation.owenScore?.toFixed(4) ?? "none"} siglip=${moderation.siglipScore?.toFixed(4) ?? "none"} public_spoiler=${moderation.publicSpoiler}`,
-        );
-        const stored = await storeTelegramMedia(downloaded.filePath, downloaded.mimeType, downloaded.mediaType, {
+        let publicSpoiler = false;
+        for (const [index, item] of downloads.entries()) {
+          const moderation = await classifyNsfw(
+            item.filePath,
+            item.mediaType,
+            item.mediaType === "video" || item.mimeType === "image/gif" || Boolean(item.telegramSendAsAnimation),
+          );
+          publicSpoiler ||= moderation.publicSpoiler;
+          console.log(
+            `[nsfw] asset=${assetId} item=${index + 1}/${downloads.length} status=${moderation.status} owen=${moderation.owenScore?.toFixed(4) ?? "none"} siglip=${moderation.siglipScore?.toFixed(4) ?? "none"} public_spoiler=${moderation.publicSpoiler}`,
+          );
+        }
+        const storageMetadata = {
           originalUrl: job.url,
           normalizedUrl,
-          sha256: downloaded.sha256,
+          sha256,
           streamerLogin: job.chatPost.streamSession.streamer.login,
           streamerDisplayName: job.chatPost.streamSession.streamer.displayName,
           streamStartedAt: job.chatPost.streamSession.startedAt,
@@ -99,7 +113,14 @@ async function processOneJob(): Promise<void> {
           messageText: job.chatPost.messageText,
           skipTelegramPublic: job.chatPost.skipTelegramPublic,
           telegramSendAsAnimation: downloaded.telegramSendAsAnimation,
-        });
+        };
+        const stored =
+          downloads.length === 1
+            ? await storeTelegramMedia(downloaded.filePath, downloaded.mimeType, downloaded.mediaType, storageMetadata)
+            : await storeTelegramMediaGroup(
+                downloads.map((item) => ({ filePath: item.filePath, mimeType: item.mimeType })),
+                storageMetadata,
+              );
 
         const asset = await prisma.asset.upsert({
           where: { normalizedUrl },
@@ -107,33 +128,39 @@ async function processOneJob(): Promise<void> {
             id: assetId,
             originalUrl: job.url,
             normalizedUrl,
-            sha256: downloaded.sha256,
+            sha256,
+            sha256s,
             storageProvider: stored.storageProvider,
             telegramChatId: stored.telegramChatId,
             telegramMessageId: stored.telegramMessageId,
+            telegramMessageIds: stored.telegramMessageIds,
             telegramFileId: stored.telegramFileId,
+            telegramFileIds: stored.telegramFileIds,
             telegramFileUniqueId: stored.telegramFileUniqueId,
             publicTelegramChatId: null,
             publicTelegramMessageId: null,
-            publicHasSpoiler: moderation.publicSpoiler,
-            telegramIsAnimation: Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif",
+            publicHasSpoiler: publicSpoiler,
+            telegramIsAnimation: downloads.length === 1 && (Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif"),
             mimeType: downloaded.mimeType,
-            byteSize: downloaded.byteSize,
+            byteSize,
             mediaType: downloaded.mediaType,
             status: "stored",
             visibility: "public",
           },
           update: {
-            sha256: downloaded.sha256,
+            sha256,
+            sha256s,
             storageProvider: stored.storageProvider,
             telegramChatId: stored.telegramChatId,
             telegramMessageId: stored.telegramMessageId,
+            telegramMessageIds: stored.telegramMessageIds,
             telegramFileId: stored.telegramFileId,
+            telegramFileIds: stored.telegramFileIds,
             telegramFileUniqueId: stored.telegramFileUniqueId,
-            publicHasSpoiler: moderation.publicSpoiler,
-            telegramIsAnimation: Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif",
+            publicHasSpoiler: publicSpoiler,
+            telegramIsAnimation: downloads.length === 1 && (Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif"),
             mimeType: downloaded.mimeType,
-            byteSize: downloaded.byteSize,
+            byteSize,
             mediaType: downloaded.mediaType,
             status: "stored",
             visibility: "public",
@@ -142,15 +169,15 @@ async function processOneJob(): Promise<void> {
 
         await markStoredReferences(asset.id, normalizedUrl, job.id, job.chatPostId);
         await publishStoredTelegramMedia(asset, publicMetadata(job));
-        console.log(`[download] stored job=${job.id} asset=${asset.id} bytes=${downloaded.byteSize} mime=${downloaded.mimeType}`);
+        console.log(`[download] stored job=${job.id} asset=${asset.id} items=${downloads.length} bytes=${byteSize} mime=${downloaded.mimeType}`);
       });
     } finally {
-      fs.promises.rm(downloaded.filePath, { force: true }).catch(() => undefined);
+      await Promise.all(downloads.map((item) => fs.promises.rm(item.filePath, { force: true }).catch(() => undefined)));
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const currentAttempts = job.attempts;
-    const rejected = error instanceof PlatformDownloadRejectedError;
+    const rejected = error instanceof PlatformDownloadRejectedError || error instanceof MediaDownloadRejectedError;
     const retry = !rejected && currentAttempts < 3;
     const jobUpdate = prisma.downloadJob.update({
       where: { id: job.id },
@@ -295,17 +322,40 @@ async function withShaLock<T>(sha256: string, task: () => Promise<T>): Promise<T
   }
 }
 
-async function downloadMedia(rawUrl: string): Promise<DownloadResult> {
+async function downloadMedia(rawUrl: string): Promise<DownloadResult[]> {
   if (isPlatformMediaUrl(rawUrl)) {
-    return downloadPlatformVideo(rawUrl);
+    return [await downloadPlatformVideo(rawUrl)];
   }
-  return downloadDirectMedia(rawUrl);
+  const pageUrl = toUrl(rawUrl);
+  if (!pageUrl) throw new Error("Invalid media URL");
+  const urls = await resolveMediaPageUrls(pageUrl);
+  if (urls.length > telegramMediaGroupMaxItems) {
+    throw new MediaDownloadRejectedError(`Media album has too many items: ${urls.length} > ${telegramMediaGroupMaxItems}`);
+  }
+  const downloads: DownloadResult[] = [];
+  let totalBytes = 0;
+  const aggregateLimit = Math.min(env.MAX_VIDEO_BYTES, env.MAX_IMAGE_BYTES * telegramMediaGroupMaxItems);
+  try {
+    for (const url of urls) {
+      const downloaded = await downloadDirectMedia(url);
+      downloads.push(downloaded);
+      if (urls.length > 1 && downloaded.mediaType !== "image") {
+        throw new MediaDownloadRejectedError("Media albums may only contain images");
+      }
+      totalBytes += downloaded.byteSize;
+      if (urls.length > 1 && totalBytes > aggregateLimit) {
+        throw new MediaDownloadRejectedError(`Media album is too large: ${totalBytes} > ${aggregateLimit}`);
+      }
+    }
+    return downloads;
+  } catch (error) {
+    await Promise.all(downloads.map((item) => fs.promises.rm(item.filePath, { force: true }).catch(() => undefined)));
+    throw error;
+  }
 }
 
-async function downloadDirectMedia(rawUrl: string): Promise<DownloadResult> {
-  let url = toUrl(rawUrl);
-  if (!url) throw new Error("Invalid media URL");
-  url = await resolveMediaPageUrl(url);
+async function downloadDirectMedia(initialUrl: URL): Promise<DownloadResult> {
+  let url = initialUrl;
 
   for (let redirects = 0; redirects <= 4; redirects += 1) {
     await assertSafeNetworkTarget(url);
@@ -363,13 +413,13 @@ async function downloadDirectMedia(rawUrl: string): Promise<DownloadResult> {
   throw new Error("Too many redirects");
 }
 
-async function resolveMediaPageUrl(url: URL): Promise<URL> {
+async function resolveMediaPageUrls(url: URL): Promise<URL[]> {
   if (isYandexDiskUrl(url.toString())) {
     const directUrl = await resolveYandexDiskMediaUrl(url, env.MAX_IMAGE_BYTES, env.MAX_VIDEO_BYTES);
     await assertSafeNetworkTarget(directUrl);
-    return directUrl;
+    return [directUrl];
   }
-  if (!isResolvableMediaPageUrl(url.toString())) return url;
+  if (!isResolvableMediaPageUrl(url.toString())) return [url];
 
   let pageUrl = url;
   for (let redirects = 0; redirects <= 4; redirects += 1) {
@@ -384,11 +434,11 @@ async function resolveMediaPageUrl(url: URL): Promise<URL> {
     }
     if (!response.ok) throw new Error(`Media page failed with ${response.status}`);
 
-    const imageUrl = extractPostimageDirectImageUrl(await response.text(), pageUrl);
-    if (!imageUrl) throw new Error("Media page direct image not found");
-    await assertSafeNetworkTarget(imageUrl);
-    console.log(`[resolver] media page=${url.toString()} image=${imageUrl.toString()}`);
-    return imageUrl;
+    const mediaUrls = extractMediaPageUrls(await response.text(), pageUrl);
+    if (mediaUrls.length === 0) throw new Error("Media page direct media not found");
+    for (const mediaUrl of mediaUrls) await assertSafeNetworkTarget(mediaUrl);
+    console.log(`[resolver] media page=${url.toString()} items=${mediaUrls.length}`);
+    return mediaUrls;
   }
 
   throw new Error("Too many media page redirects");

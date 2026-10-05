@@ -100,7 +100,9 @@ adminBot.callbackQuery(/^hide:(.+)$/, async (ctx) => {
 adminBot.callbackQuery(/^del:(.+)$/, async (ctx) => {
   const asset = await prisma.asset.findUniqueOrThrow({ where: { id: ctx.match[1] } });
   if (asset.telegramChatId && asset.telegramMessageId) {
-    await adminBot.api.deleteMessage(asset.telegramChatId, asset.telegramMessageId).catch((error) => {
+    const messageIds = asset.telegramMessageIds.length > 1 ? asset.telegramMessageIds : [asset.telegramMessageId];
+    const deleted = messageIds.length > 1 ? adminBot.api.deleteMessages(asset.telegramChatId, messageIds) : adminBot.api.deleteMessage(asset.telegramChatId, messageIds[0]!);
+    await deleted.catch((error) => {
       console.warn("[moderation] deleteMessage failed", error);
     });
   }
@@ -132,6 +134,21 @@ adminBot.callbackQuery(/^del:(.+)$/, async (ctx) => {
         sourceAssetId: asset.id,
       },
     });
+
+    for (const sha256 of new Set(asset.sha256s.filter((hash) => hash !== asset.sha256))) {
+      await tx.blockedMedia.upsert({
+        where: { sha256 },
+        create: {
+          sha256,
+          reason: "telegram moderation",
+          sourceAssetId: asset.id,
+        },
+        update: {
+          reason: "telegram moderation",
+          sourceAssetId: asset.id,
+        },
+      });
+    }
   });
 
   await answerCallbackQuerySafely(ctx, { text: "Удалено и заблокировано" });
@@ -435,11 +452,22 @@ async function sendPublicMessages(ctx: Context, streamId: string, offset: number
     const asset = post.asset;
     if (!asset?.telegramChatId || !asset.telegramMessageId) continue;
 
-    await schedulePublicChatMessage(ctx.chat!.id, () =>
-      ctx.api.copyMessage(ctx.chat!.id, asset.telegramChatId!, asset.telegramMessageId!, {
-        caption: publicMediaCaption(post),
-      }),
-    );
+    if (asset.telegramMessageIds.length > 1) {
+      const copied = await schedulePublicChatMessage(ctx.chat!.id, () =>
+        ctx.api.copyMessages(ctx.chat!.id, asset.telegramChatId!, asset.telegramMessageIds, { remove_caption: true }),
+      );
+      if (copied[0]) {
+        await schedulePublicChatMessage(ctx.chat!.id, () =>
+          ctx.api.editMessageCaption(ctx.chat!.id, copied[0]!.message_id, { caption: publicMediaCaption(post) }),
+        );
+      }
+    } else {
+      await schedulePublicChatMessage(ctx.chat!.id, () =>
+        ctx.api.copyMessage(ctx.chat!.id, asset.telegramChatId!, asset.telegramMessageId!, {
+          caption: publicMediaCaption(post),
+        }),
+      );
+    }
     copied += 1;
   }
 
@@ -463,10 +491,17 @@ async function sendPosts(ctx: Context, posts: PostWithMedia[]): Promise<void> {
       continue;
     }
 
-    await ctx.api.copyMessage(ctx.chat!.id, asset.telegramChatId, asset.telegramMessageId, {
-      caption: mediaCaption(post),
-      reply_markup: new InlineKeyboard().text("Скрыть", `hide:${asset.id}`).text("Удалить", `del:${asset.id}`),
-    });
+    const controls = new InlineKeyboard().text("Скрыть", `hide:${asset.id}`).text("Удалить", `del:${asset.id}`);
+    if (asset.telegramMessageIds.length > 1) {
+      const copied = await ctx.api.copyMessages(ctx.chat!.id, asset.telegramChatId, asset.telegramMessageIds, { remove_caption: true });
+      if (copied[0]) await ctx.api.editMessageCaption(ctx.chat!.id, copied[0].message_id, { caption: mediaCaption(post) });
+      await ctx.reply("Управление альбомом", { reply_markup: controls });
+    } else {
+      await ctx.api.copyMessage(ctx.chat!.id, asset.telegramChatId, asset.telegramMessageId, {
+        caption: mediaCaption(post),
+        reply_markup: controls,
+      });
+    }
   }
 }
 

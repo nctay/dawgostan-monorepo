@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const apiMock = vi.hoisted(() => ({ sendPhoto: vi.fn(), sendVideo: vi.fn(), sendAnimation: vi.fn(), copyMessage: vi.fn() }));
+const apiMock = vi.hoisted(() => ({ sendPhoto: vi.fn(), sendVideo: vi.fn(), sendAnimation: vi.fn(), sendMediaGroup: vi.fn(), copyMessage: vi.fn() }));
 const inputFileMock = vi.hoisted(() => vi.fn());
 const prismaMock = vi.hoisted(() => ({ asset: { updateMany: vi.fn() } }));
 
@@ -106,6 +106,61 @@ describe("Telegram media spoilers", () => {
     expect(stored.telegramFileId).toBe("document-file");
   });
 
+  it("stores an image album as one Telegram media group", async () => {
+    apiMock.sendMediaGroup.mockResolvedValue([
+      { chat: { id: -100 }, message_id: 10, photo: [{ file_id: "file-1", file_unique_id: "unique-1" }] },
+      { chat: { id: -100 }, message_id: 11, photo: [{ file_id: "file-2", file_unique_id: "unique-2" }] },
+    ]);
+    const { storeTelegramMediaGroup } = await import("./telegram-storage.js");
+
+    const stored = await storeTelegramMediaGroup(
+      [
+        { filePath: "/dev/null", mimeType: "image/webp" },
+        { filePath: "/dev/null", mimeType: "image/webp" },
+      ],
+      {
+        originalUrl: "https://eblo.id/ATTkHNV",
+        normalizedUrl: "https://eblo.id/ATTkHNV",
+        sha256: "hash",
+        streamerLogin: "streamer",
+        streamerDisplayName: "Streamer",
+        streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        streamSessionId: "session",
+        assetId: "asset",
+        authorName: "Viewer",
+        messageText: "https://eblo.id/ATTkHNV",
+        skipTelegramPublic: false,
+      },
+    );
+
+    expect(apiMock.sendMediaGroup).toHaveBeenCalledOnce();
+    expect(apiMock.sendMediaGroup.mock.calls[0]?.[1]).toHaveLength(2);
+    expect(stored.telegramMessageIds).toEqual([10, 11]);
+    expect(stored.telegramFileIds).toEqual(["file-1", "file-2"]);
+  });
+
+  it("rejects albums larger than one Telegram media group before upload", async () => {
+    const { storeTelegramMediaGroup } = await import("./telegram-storage.js");
+    const files = Array.from({ length: 11 }, () => ({ filePath: "/dev/null", mimeType: "image/webp" }));
+
+    await expect(
+      storeTelegramMediaGroup(files, {
+        originalUrl: "https://eblo.id/album",
+        normalizedUrl: "https://eblo.id/album",
+        sha256: "hash",
+        streamerLogin: "streamer",
+        streamerDisplayName: "Streamer",
+        streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        streamSessionId: "session",
+        assetId: "asset",
+        authorName: "Viewer",
+        messageText: "https://eblo.id/album",
+        skipTelegramPublic: false,
+      }),
+    ).rejects.toThrow("at most 10 files");
+    expect(apiMock.sendMediaGroup).not.toHaveBeenCalled();
+  });
+
   it("does not publish hidden assets", async () => {
     const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
 
@@ -165,6 +220,45 @@ describe("Telegram media spoilers", () => {
       "-100public",
       "file",
       expect.objectContaining({ has_spoiler: true }),
+    );
+    expect(apiMock.copyMessage).not.toHaveBeenCalled();
+  });
+
+  it("publishes an album as one media group", async () => {
+    apiMock.sendMediaGroup.mockResolvedValue([{ message_id: 20 }, { message_id: 21 }]);
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+
+    await publishStoredTelegramMedia(
+      {
+        id: "asset",
+        visibility: "public",
+        telegramChatId: "-100storage",
+        telegramMessageId: 10,
+        telegramMessageIds: [10, 11],
+        telegramFileId: "file-1",
+        telegramFileIds: ["file-1", "file-2"],
+        telegramIsAnimation: false,
+        publicHasSpoiler: true,
+        mimeType: "image/webp",
+        mediaType: "image",
+        publicTelegramChatId: null,
+        publicTelegramMessageId: null,
+      },
+      {
+        streamerLogin: "streamer",
+        streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        authorName: "Viewer",
+        messageText: "https://eblo.id/ATTkHNV",
+        skipTelegramPublic: false,
+      },
+    );
+
+    expect(apiMock.sendMediaGroup).toHaveBeenCalledWith(
+      "-100public",
+      [
+        expect.objectContaining({ media: "file-1", has_spoiler: true, caption: expect.stringContaining("#streamer_stream") }),
+        expect.objectContaining({ media: "file-2", has_spoiler: true }),
+      ],
     );
     expect(apiMock.copyMessage).not.toHaveBeenCalled();
   });

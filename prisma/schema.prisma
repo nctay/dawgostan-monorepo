@@ -173,10 +173,13 @@ model Asset {
   originalUrl          String
   normalizedUrl        String          @unique
   sha256               String?         @unique
+  sha256s              String[]        @default([])
   storageProvider      StorageProvider @default(telegram)
   telegramChatId       String?
   telegramMessageId    Int?
+  telegramMessageIds   Int[]           @default([])
   telegramFileId       String?
+  telegramFileIds      String[]        @default([])
   telegramFileUniqueId String?
   publicTelegramChatId String?
   publicTelegramMessageId Int?
