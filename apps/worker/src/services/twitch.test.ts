@@ -160,7 +160,11 @@ describe("twitch media ingestion", () => {
 
   it("stores the public Telegram skip flag with the media post", async () => {
     const { ingestChatMessage } = await import("./twitch.js");
-    prismaMock.streamer.findUnique.mockResolvedValue({ id: "streamer-1", login: "streamer" });
+    prismaMock.streamer.findUnique.mockResolvedValue({
+      id: "streamer-1",
+      login: "streamer",
+      youtubeDisabledUntil: new Date("2000-01-01T00:00:00Z"),
+    });
     prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
     prismaMock.blockedMedia.findUnique.mockResolvedValue(null);
     prismaMock.asset.findUnique.mockResolvedValue(null);
@@ -173,13 +177,34 @@ describe("twitch media ingestion", () => {
       streamerLogin: "streamer",
       twitchMessageId: "message-1",
       authorName: "Viewer",
-      messageText: "!skip_tghttps://example.com/a.jpg",
+      messageText: "!skip_tghttps://youtu.be/abc123",
       postedAt: new Date("2026-06-12T10:04:00Z"),
     });
 
     expect(prismaMock.chatPost.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ skipTelegramPublic: true }) }),
     );
+  });
+
+  it("skips YouTube while it is disabled for the streamer", async () => {
+    const { ingestChatMessage } = await import("./twitch.js");
+    prismaMock.streamer.findUnique.mockResolvedValue({
+      id: "streamer-1",
+      login: "ankohu",
+      youtubeDisabledUntil: new Date("2099-01-01T00:00:00Z"),
+    });
+    prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
+
+    await ingestChatMessage({
+      streamerLogin: "ankohu",
+      twitchMessageId: "message-1",
+      authorName: "Viewer",
+      messageText: "https://youtu.be/abc123",
+      postedAt: new Date("2026-06-12T10:04:00Z"),
+    });
+
+    expect(prismaMock.chatPost.create).not.toHaveBeenCalled();
+    expect(prismaMock.downloadJob.create).not.toHaveBeenCalled();
   });
 
   it.each(["clck.su", "bit.ly", "tinyurl.com", "clck.ru"])("resolves %s short links before queueing media", async (host) => {

@@ -1,6 +1,6 @@
 import tmi from "tmi.js";
 import WebSocket from "ws";
-import { extractUrls, normalizeUrl } from "@dawgostan/core";
+import { extractUrls, normalizeUrl, toUrl } from "@dawgostan/core";
 import { prisma } from "../prisma.js";
 import { env, privateStreamerLogins } from "../env.js";
 import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, stripSkipTelegramPublicTag } from "./chat-filter.js";
@@ -514,6 +514,10 @@ export async function ingestChatMessage(input: {
   for (const candidateUrl of urls) {
     const rawUrl = await resolveSupportedMediaUrl(candidateUrl);
     if (!rawUrl) continue;
+    if (streamer.youtubeDisabledUntil && streamer.youtubeDisabledUntil > new Date() && isYouTubeUrl(rawUrl)) {
+      console.log(`[chat] ignored youtube channel=${input.streamerLogin} until=${streamer.youtubeDisabledUntil.toISOString()}`);
+      continue;
+    }
     const normalizedUrl = normalizeUrl(rawUrl);
     if (!normalizedUrl) continue;
     console.log(`[chat] media-url author=${input.authorName} url=${rawUrl} normalized=${normalizedUrl}`);
@@ -604,6 +608,11 @@ export async function ingestChatMessage(input: {
       console.log(`[download] queued chatPost=${post.id} asset=${asset.id}`);
     }
   }
+}
+
+function isYouTubeUrl(rawUrl: string): boolean {
+  const hostname = toUrl(rawUrl)?.hostname.toLowerCase();
+  return hostname === "youtu.be" || hostname === "youtube.com" || hostname?.endsWith(".youtube.com") === true;
 }
 
 async function findStoredAssetForNormalizedUrl(normalizedUrl: string) {

@@ -65,6 +65,7 @@ model Streamer {
   login           String               @unique
   displayName     String
   enabled         Boolean              @default(true)
+  youtubeDisabledUntil DateTime?
   lastStatus      StreamerStatus       @default(unknown)
   lastCheckedAt   DateTime?
   createdAt       DateTime             @default(now())
