@@ -222,6 +222,19 @@ describe("twitch media ingestion", () => {
       }),
     );
   });
+
+  it("stops short-link redirect loops without error logging", async () => {
+    const loopUrl = "https://bit.ly/bukva_invite";
+    const fetchMock = vi.fn(async () => new Response(null, { status: 302, headers: { location: loopUrl } }));
+    const warnMock = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    envMock.ALLOW_PRIVATE_MEDIA_HOSTS = true;
+    global.fetch = fetchMock as typeof fetch;
+    const { resolveSupportedMediaUrl } = await import("./redirect-resolver.js");
+
+    expect(await resolveSupportedMediaUrl(loopUrl)).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(warnMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("twitch EventSub subscriptions", () => {

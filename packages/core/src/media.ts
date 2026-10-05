@@ -108,7 +108,8 @@ export function isPlatformMediaUrl(rawUrl: string): boolean {
 
   if (hostname === "youtu.be") return url.pathname.length > 1;
   if (hostname.endsWith("youtube.com")) return url.pathname.startsWith("/shorts/") || (url.pathname === "/watch" && Boolean(url.searchParams.get("v")));
-  if (hostname.endsWith("tiktok.com")) return url.pathname.length > 1;
+  if (["vm.tiktok.com", "vt.tiktok.com"].includes(hostname)) return url.pathname.length > 1;
+  if (["tiktok.com", "www.tiktok.com"].includes(hostname)) return /^\/(?:@[^/]+\/video\/\d+|t\/[^/]+)\/?$/.test(url.pathname);
   return false;
 }
 

@@ -31,8 +31,11 @@ function isShortLinkUrl(rawUrl: string): boolean {
 async function resolveShortLink(rawUrl: string): Promise<URL | null> {
   let url = toUrl(rawUrl);
   if (!url) return null;
+  const visited = new Set<string>();
 
   for (let redirects = 0; redirects <= 4; redirects += 1) {
+    if (visited.has(url.toString())) return null;
+    visited.add(url.toString());
     await assertSafeNetworkTarget(url);
     const response = await fetch(url, {
       redirect: "manual",
@@ -52,7 +55,7 @@ async function resolveShortLink(rawUrl: string): Promise<URL | null> {
     return extractHtmlRedirectUrl(await response.text(), url);
   }
 
-  throw new Error("Too many short-link redirects");
+  return null;
 }
 
 function extractHtmlRedirectUrl(html: string, baseUrl: URL): URL | null {
