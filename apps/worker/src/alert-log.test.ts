@@ -57,4 +57,25 @@ describe("operational alert logging", () => {
       error_code: "dns",
     });
   });
+
+  it("keeps known action-required messages human readable", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    logServiceAlert({
+      code: "twitch_channel_unavailable",
+      title: "Twitch-канал недоступен",
+      component: "twitch-chat",
+      context: "channel=ankohu",
+      severity: "action",
+      reason: "Канал удалён, переименован или заблокирован Twitch",
+      errorCode: "msg_channel_suspended",
+      error: new Error("This channel does not exist or has been suspended."),
+    });
+
+    expect(JSON.parse(String(errorSpy.mock.calls[0]?.[0]))).toMatchObject({
+      alert_severity: "action",
+      alert_reason: "Канал удалён, переименован или заблокирован Twitch",
+      error_code: "msg_channel_suspended",
+    });
+  });
 });

@@ -21,6 +21,7 @@ describe("bot alert logging", () => {
       alert_title: "Ошибка Telegram-бота",
       alert_reason: "Telegram запретил боту доступ к чату или пользователю",
       alert_context: "scope=public-bot",
+      alert_severity: "action",
       error_code: "access_denied",
     });
   });

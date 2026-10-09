@@ -108,6 +108,7 @@ adminBot.callbackQuery(/^del:(.+)$/, async (ctx) => {
         scope: "moderation",
         code: "telegram_delete_failed",
         title: "Не удалось удалить медиа из Telegram",
+        severity: "action",
         error,
         details: { asset_id: asset.id },
       });

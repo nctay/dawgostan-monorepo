@@ -204,6 +204,19 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
   chatEvents.on("disconnected", (reason: string) => console.warn(`[chat] disconnected reason=${reason}`));
   chatEvents.on("reconnect", () => console.warn("[chat] reconnecting"));
   chatEvents.on("notice", (channel: string, msgid: string, message: string) => {
+    if (msgid === "msg_channel_suspended" || msgid === "msg_room_not_found") {
+      logServiceAlert({
+        code: "twitch_channel_unavailable",
+        title: "Twitch-канал недоступен",
+        component: "twitch-chat",
+        context: `channel=${channel.replace(/^#/, "")}`,
+        severity: "action",
+        reason: "Канал удалён, переименован или заблокирован Twitch",
+        errorCode: msgid,
+        error: new Error(message),
+      });
+      return;
+    }
     console.warn(`[chat] notice channel=${channel} msgid=${msgid} message=${message}`);
   });
 }

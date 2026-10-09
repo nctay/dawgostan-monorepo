@@ -3,6 +3,7 @@ type BotAlertInput = {
   error: unknown;
   code?: string;
   title?: string;
+  severity?: "warning" | "action";
   details?: Record<string, string | number | null | undefined>;
 };
 
@@ -13,7 +14,7 @@ export function logBotAlert(input: BotAlertInput): void {
       alert_code: input.code ?? "telegram_bot_error",
       alert_title: input.title ?? "Ошибка Telegram-бота",
       alert_reason: classified.reason,
-      alert_severity: "warning",
+      alert_severity: input.severity ?? (classified.code === "access_denied" ? "action" : "warning"),
       alert_component: "telegram",
       alert_context: `scope=${input.scope}`,
       error_code: classified.code,

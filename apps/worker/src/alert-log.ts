@@ -1,4 +1,4 @@
-export type AlertSeverity = "warning" | "critical";
+export type AlertSeverity = "warning" | "action" | "critical";
 
 type ServiceAlert = {
   code: string;
@@ -6,21 +6,24 @@ type ServiceAlert = {
   component: string;
   error: unknown;
   severity?: AlertSeverity;
+  reason?: string;
+  errorCode?: string;
   context?: string;
   details?: Record<string, string | number | boolean | null | undefined>;
 };
 
 export function logServiceAlert(alert: ServiceAlert): void {
   const classified = classifyOperationalError(alert.error);
+  const severity = alert.severity ?? (classified.code === "access_denied" ? "action" : "warning");
   console.error(
     JSON.stringify({
       alert_code: alert.code,
       alert_title: alert.title,
-      alert_reason: classified.reason,
-      alert_severity: alert.severity ?? "warning",
+      alert_reason: alert.reason ?? classified.reason,
+      alert_severity: severity,
       alert_component: alert.component,
       ...(alert.context ? { alert_context: alert.context } : {}),
-      error_code: classified.code,
+      error_code: alert.errorCode ?? classified.code,
       error_message: operationalErrorText(alert.error).slice(0, 2_000),
       ...(alert.details ? { details: alert.details } : {}),
     }),
