@@ -4,6 +4,7 @@ import { Bot, InputFile } from "grammy";
 import type { Message } from "grammy/types";
 import { env, privateStreamerLogins } from "../env.js";
 import { prisma } from "../prisma.js";
+import { logServiceAlert } from "../alert-log.js";
 import { stripSkipTelegramPublicTag } from "./chat-filter.js";
 import { SerialRateLimiter } from "./rate-limit.js";
 
@@ -196,7 +197,12 @@ async function readVideoMetadata(filePath: string): Promise<{ width?: number; he
       duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : undefined,
     };
   } catch (error) {
-    console.warn("[telegram] ffprobe video metadata failed", error);
+    logServiceAlert({
+      code: "ffprobe_failed",
+      title: "Не удалось определить параметры видео",
+      component: "media-processing",
+      error,
+    });
     return {};
   }
 }

@@ -89,6 +89,12 @@ describe("download failure cleanup", () => {
       data: { status: "failed" },
     });
     expect(prismaMock.$transaction).toHaveBeenCalledOnce();
+    const alert = JSON.parse(String(vi.mocked(console.error).mock.calls[0]?.[0]));
+    expect(alert).toMatchObject({
+      alert_code: "download_failed",
+      alert_title: "Не удалось скачать медиа",
+      alert_context: "platform=unknown",
+    });
   });
 
 });

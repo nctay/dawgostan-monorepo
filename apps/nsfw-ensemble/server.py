@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -51,7 +52,16 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnidentifiedImageError) as error:
             self.send_error(400, str(error))
             return
-        except Exception:
+        except Exception as error:
+            print(json.dumps({
+                'alert_code': 'nsfw_classification_failed',
+                'alert_title': 'Ошибка NSFW-классификатора',
+                'alert_reason': 'Не хватило памяти при анализе изображения' if isinstance(error, MemoryError) else 'Не удалось проверить изображение',
+                'alert_severity': 'warning',
+                'alert_component': 'nsfw',
+                'error_code': 'memory' if isinstance(error, MemoryError) else 'classification',
+                'error_message': f'{type(error).__name__}: {error}',
+            }, ensure_ascii=False), file=sys.stderr, flush=True)
             logging.exception('classification failed')
             self.send_error(500)
             return

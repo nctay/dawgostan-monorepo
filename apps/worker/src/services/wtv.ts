@@ -4,6 +4,7 @@ import { wtvChannels } from "../env.js";
 import { ingestChatMessage } from "./twitch.js";
 import { isWithinOfflineGrace, offlineGraceMs } from "./stream-grace.js";
 import { isSupportedMediaCandidateUrl } from "./redirect-resolver.js";
+import { logServiceAlert } from "../alert-log.js";
 
 type WtvProfileResponse = {
   profile: {
@@ -64,7 +65,13 @@ export async function pollWtvStreams(): Promise<void> {
       const live = await pollWtvChannel(channel);
       if (live) liveLogins.push(live);
     } catch (error) {
-      console.error(`[wtv] poll failed channel=${channel}`, error);
+      logServiceAlert({
+        code: "wtv_poll_failed",
+        title: "WTV недоступен",
+        component: "wtv",
+        context: `channel=${channel}`,
+        error,
+      });
     }
   }
 

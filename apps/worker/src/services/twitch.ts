@@ -7,6 +7,7 @@ import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, st
 import { isWithinOfflineGrace, offlineGraceMs } from "./stream-grace.js";
 import { publishDeletedChatMessage, publishStoredTelegramMedia } from "./telegram-storage.js";
 import { isSupportedMediaCandidateUrl, resolveSupportedMediaUrl } from "./redirect-resolver.js";
+import { logServiceAlert } from "../alert-log.js";
 
 type TwitchStream = {
   id: string;
@@ -83,7 +84,14 @@ export function ensureEventSubConnected(): void {
   console.log("[eventsub] connecting websocket");
   eventSubSocket = new WebSocket("wss://eventsub.wss.twitch.tv/ws");
   eventSubSocket.on("message", (raw) => {
-    void handleEventSubMessage(String(raw)).catch((error) => console.error("EventSub error", error));
+    void handleEventSubMessage(String(raw)).catch((error) =>
+      logServiceAlert({
+        code: "twitch_eventsub_message_failed",
+        title: "Ошибка обработки Twitch EventSub",
+        component: "twitch-eventsub",
+        error,
+      }),
+    );
   });
   eventSubSocket.on("close", () => {
     console.log("[eventsub] websocket closed");
@@ -91,7 +99,12 @@ export function ensureEventSubConnected(): void {
     setTimeout(ensureEventSubConnected, 10_000);
   });
   eventSubSocket.on("error", (error) => {
-    console.error("EventSub socket error", error);
+    logServiceAlert({
+      code: "twitch_eventsub_socket_failed",
+      title: "Соединение Twitch EventSub прервано",
+      component: "twitch-eventsub",
+      error,
+    });
     eventSubSocket?.close();
   });
 }
@@ -122,7 +135,6 @@ export async function ensureChatConnected(): Promise<void> {
     }
 
     chatClient = null;
-    console.error("[chat] connect failed", error);
     throw error;
   } finally {
     chatConnecting = false;
@@ -158,7 +170,13 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
         messageText: message,
         postedAt: new Date(),
       }).catch((error) => {
-        console.error("Failed to record chat message", error);
+        logServiceAlert({
+          code: "chat_record_failed",
+          title: "Не удалось сохранить сообщение чата",
+          component: "twitch-chat",
+          context: `channel=${login}`,
+          error,
+        });
       });
       await ingestChatMessage({
         streamerLogin: login,
@@ -169,7 +187,13 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
         postedAt: new Date(),
       });
     } catch (error) {
-      console.error("Failed to ingest chat message", error);
+      logServiceAlert({
+        code: "chat_ingest_failed",
+        title: "Не удалось обработать сообщение чата",
+        component: "twitch-chat",
+        context: `channel=${login}`,
+        error,
+      });
     }
   });
   const chatEvents = client as unknown as {
@@ -283,7 +307,14 @@ async function subscribeEventSub(sessionId: string): Promise<void> {
   );
   const failed = results.filter((result) => !result.response.ok);
   for (const result of failed) {
-    console.warn(`[eventsub] subscribe failed type=${result.spec.type} status=${result.response.status} body=${result.body}`);
+    logServiceAlert({
+      code: "twitch_eventsub_subscribe_failed",
+      title: "Не удалось подписаться на Twitch EventSub",
+      component: "twitch-eventsub",
+      context: `type=${result.spec.type}`,
+      error: new Error(`Twitch EventSub subscribe failed with ${result.response.status}`),
+      details: { status: result.response.status, body: result.body.slice(0, 500) },
+    });
   }
   console.log(`[eventsub] subscriptions requested=${results.length} failed=${failed.length}`);
 }

@@ -1,6 +1,7 @@
 import dns from "node:dns/promises";
 import { assertSafeResolvedAddress, assertSafeUrl, extractUrls, isSupportedMediaUrl, toUrl } from "@dawgostan/core";
 import { env } from "../env.js";
+import { logServiceAlert } from "../alert-log.js";
 
 const shortLinkHosts = new Set(["clck.su", "www.clck.su", "bit.ly", "www.bit.ly", "tinyurl.com", "www.tinyurl.com", "clck.ru", "www.clck.ru"]);
 
@@ -18,7 +19,13 @@ export async function resolveSupportedMediaUrl(rawUrl: string): Promise<string |
     console.log(`[resolver] short-link url=${rawUrl} resolved=${resolved.toString()}`);
     return resolved.toString();
   } catch (error) {
-    console.warn(`[resolver] short-link failed url=${rawUrl}`, error);
+    logServiceAlert({
+      code: "short_link_resolution_failed",
+      title: "Не удалось раскрыть короткую ссылку",
+      component: "url-resolver",
+      context: `host=${toUrl(rawUrl)?.hostname ?? "unknown"}`,
+      error,
+    });
     return null;
   }
 }

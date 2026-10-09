@@ -15,6 +15,7 @@ import { publishStoredTelegramMedia, storeTelegramMedia, storeTelegramMediaGroup
 import { extractMediaPageUrls, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
+import { logServiceAlert } from "../alert-log.js";
 
 type DownloadResult = {
   filePath: string;
@@ -205,7 +206,37 @@ async function processOneJob(): Promise<void> {
         ]));
     const log = `[download] ${rejected ? "rejected" : "failed"} job=${job.id} asset=${job.assetId ?? "none"} attempts=${currentAttempts} retry=${retry} error=${message}`;
     if (rejected) console.info(log);
-    else console.error(log);
+    else if (retry) console.warn(log);
+    else {
+      logServiceAlert({
+        code: "download_failed",
+        title: "Не удалось скачать медиа",
+        component: "downloader",
+        context: `platform=${mediaSource(job.url)}`,
+        error,
+        details: {
+          job_id: job.id,
+          asset_id: job.assetId,
+          attempts: currentAttempts,
+          streamer: job.chatPost.streamSession.streamer.login,
+        },
+      });
+    }
+  }
+}
+
+function mediaSource(rawUrl: string): string {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    if (host.includes("youtube.com") || host === "youtu.be") return "youtube";
+    if (host.includes("tiktok.com")) return "tiktok";
+    if (host.includes("twitch.tv")) return "twitch";
+    if (host === "postimg.cc" || host === "ibb.co" || host === "eblo.id") return "image-host";
+    if (host.endsWith("yandex.ru") || host === "yadi.sk") return "yandex-disk";
+    if (host.endsWith("discordapp.com") || host.endsWith("discordapp.net")) return "discord";
+    return "direct";
+  } catch {
+    return "unknown";
   }
 }
 

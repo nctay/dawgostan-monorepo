@@ -2,21 +2,39 @@ import { cleanupExpiredChatMessages, ensureChatConnected, ensureEventSubConnecte
 import { pollWtvStreams } from "./services/wtv.js";
 import { processDownloadQueue } from "./services/downloader.js";
 import { prisma } from "./prisma.js";
+import { logServiceAlert } from "./alert-log.js";
 
 let shuttingDown = false;
 let downloadTask: Promise<void> | null = null;
 
 async function tick(): Promise<void> {
   ensureEventSubConnected();
-  void ensureChatConnected().catch((error) => console.error("[tick] chat failed", error));
+  void ensureChatConnected().catch((error) =>
+    logServiceAlert({ code: "twitch_chat_connect_failed", title: "Twitch-чат недоступен", component: "twitch-chat", error }),
+  );
   downloadTask ??= processDownloadQueue()
-    .catch((error) => console.error("[tick] downloads failed", error))
+    .catch((error) =>
+      logServiceAlert({
+        code: "download_queue_failed",
+        title: "Очередь загрузок остановилась",
+        component: "downloader",
+        severity: "critical",
+        error,
+      }),
+    )
     .finally(() => {
       downloadTask = null;
     });
-  const results = await Promise.allSettled([pollTwitchStreams(), pollWtvStreams(), cleanupExpiredChatMessages()]);
-  for (const result of results) {
-    if (result.status === "rejected") console.error("[tick] task failed", result.reason);
+  const tasks = [
+    { code: "twitch_poll_failed", title: "Не удалось проверить Twitch-стримы", component: "twitch", promise: pollTwitchStreams() },
+    { code: "wtv_task_failed", title: "Не удалось проверить WTV-стримы", component: "wtv", promise: pollWtvStreams() },
+    { code: "chat_cleanup_failed", title: "Не удалось очистить старые сообщения", component: "database", promise: cleanupExpiredChatMessages() },
+  ];
+  const results = await Promise.allSettled(tasks.map((task) => task.promise));
+  for (const [index, result] of results.entries()) {
+    if (result.status !== "rejected") continue;
+    const task = tasks[index]!;
+    logServiceAlert({ code: task.code, title: task.title, component: task.component, error: result.reason });
   }
 }
 

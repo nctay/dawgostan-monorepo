@@ -4,6 +4,7 @@ import type { Prisma } from "@prisma/client";
 import { allowedUserIds, env, privateStreamerLogins } from "./env.js";
 import { prisma } from "./prisma.js";
 import { SerialRateLimiter, withTelegramRetry } from "./rate-limit.js";
+import { logBotAlert } from "./alert-log.js";
 
 const pageSize = 10;
 const publicPageSize = 50;
@@ -103,7 +104,13 @@ adminBot.callbackQuery(/^del:(.+)$/, async (ctx) => {
     const messageIds = asset.telegramMessageIds.length > 1 ? asset.telegramMessageIds : [asset.telegramMessageId];
     const deleted = messageIds.length > 1 ? adminBot.api.deleteMessages(asset.telegramChatId, messageIds) : adminBot.api.deleteMessage(asset.telegramChatId, messageIds[0]!);
     await deleted.catch((error) => {
-      console.warn("[moderation] deleteMessage failed", error);
+      logBotAlert({
+        scope: "moderation",
+        code: "telegram_delete_failed",
+        title: "Не удалось удалить медиа из Telegram",
+        error,
+        details: { asset_id: asset.id },
+      });
     });
   }
 
@@ -235,21 +242,14 @@ async function answerCallbackQuerySafely(ctx: Context, options?: CallbackQueryOp
 function logBotError(scope: string, error: unknown): void {
   const botError = error as { error?: unknown; ctx?: Context; name?: string };
   const cause = botError.error ?? error;
-  console.error(`[${scope}] error`, sanitizeTelegramError(cause), {
-    updateId: botError.ctx?.update.update_id,
-    callbackData: botError.ctx?.callbackQuery?.data,
-    name: botError.name,
+  logBotAlert({
+    scope,
+    error: cause,
+    details: {
+      update_id: botError.ctx?.update.update_id,
+      handler: botError.name,
+    },
   });
-}
-
-function sanitizeTelegramError(error: unknown): unknown {
-  if (!(error instanceof GrammyError)) return error;
-  return {
-    method: error.method,
-    payload: error.payload,
-    error_code: error.error_code,
-    description: error.description,
-  };
 }
 
 function isExpiredCallbackQueryError(error: unknown): boolean {
