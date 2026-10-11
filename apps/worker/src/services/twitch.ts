@@ -42,9 +42,12 @@ type EventSubEvent = {
 let appToken: { value: string; expiresAt: number } | null = null;
 let chatClient: InstanceType<typeof tmi.Client> | null = null;
 let chatConnecting = false;
+let nextChatMembershipCheckAt = 0;
 let eventSubSocket: WebSocket | null = null;
 let lastChatMessageCleanupAt = 0;
 const chatMessageCleanupIntervalMs = 5 * 60 * 1000;
+const chatMembershipCheckIntervalMs = 15_000;
+const chatInitialJoinIntervalMs = 2_000;
 
 export async function pollTwitchStreams(): Promise<void> {
   if (!env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET || channelLogins().length === 0) return;
@@ -111,7 +114,13 @@ export function ensureEventSubConnected(): void {
 
 export async function ensureChatConnected(): Promise<void> {
   const channels = channelLogins();
-  if (chatClient || chatConnecting || channels.length === 0) return;
+  if (chatClient) {
+    if (Date.now() < nextChatMembershipCheckAt) return;
+    nextChatMembershipCheckAt = Date.now() + chatMembershipCheckIntervalMs;
+    await rejoinMissingChatChannel(chatClient, channels);
+    return;
+  }
+  if (chatConnecting || channels.length === 0) return;
 
   chatConnecting = true;
   console.log(`[chat] connecting channels=${channels.join(",")}`);
@@ -122,6 +131,7 @@ export async function ensureChatConnected(): Promise<void> {
   try {
     await chatClient.connect();
     console.log(`[chat] connected mode=${useAuthenticatedChat ? "authenticated" : "anonymous"}`);
+    nextChatMembershipCheckAt = Date.now() + channels.length * chatInitialJoinIntervalMs + chatMembershipCheckIntervalMs;
   } catch (error) {
     const message = errorMessage(error);
     if (useAuthenticatedChat && /login authentication failed/i.test(message)) {
@@ -131,6 +141,7 @@ export async function ensureChatConnected(): Promise<void> {
       attachChatHandlers(chatClient);
       await chatClient.connect();
       console.log("[chat] connected mode=anonymous");
+      nextChatMembershipCheckAt = Date.now() + channels.length * chatInitialJoinIntervalMs + chatMembershipCheckIntervalMs;
       return;
     }
 
@@ -138,6 +149,28 @@ export async function ensureChatConnected(): Promise<void> {
     throw error;
   } finally {
     chatConnecting = false;
+  }
+}
+
+async function rejoinMissingChatChannel(client: InstanceType<typeof tmi.Client>, channels: string[]): Promise<void> {
+  const joined = new Set(client.getChannels().map((channel) => channel.replace(/^#/, "").toLowerCase()));
+  const missing = channels.find((channel) => !joined.has(channel));
+  if (!missing) return;
+
+  try {
+    await client.join(missing);
+    console.log(`[chat] restored channel=${missing}`);
+  } catch (error) {
+    logServiceAlert({
+      code: "twitch_chat_join_failed",
+      title: "Не удалось подключиться к Twitch-чату",
+      component: "twitch-chat",
+      context: `channel=${missing}`,
+      severity: "action",
+      reason: "Worker не получает сообщения этого канала и повторит подключение автоматически",
+      errorCode: "chat_join_failed",
+      error,
+    });
   }
 }
 

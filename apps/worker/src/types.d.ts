@@ -9,6 +9,8 @@ declare module "tmi.js" {
     constructor(options: ClientOptions);
     on(event: "message", callback: (channel: string, tags: Record<string, string | undefined>, message: string, self: boolean) => void | Promise<void>): void;
     connect(): Promise<[string, number]>;
+    getChannels(): string[];
+    join(channel: string): Promise<[string]>;
   }
 
   const tmi: { Client: typeof Client };

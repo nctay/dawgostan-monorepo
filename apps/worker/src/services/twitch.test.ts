@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, stripSkipTelegramPublicTag } from "./chat-filter.js";
 import { isWithinOfflineGrace } from "./stream-grace.js";
 
@@ -31,6 +31,12 @@ const envMock = vi.hoisted(() => ({
 const privateStreamerLoginsMock = vi.hoisted(() => new Set<string>());
 const publishDeletedChatMessageMock = vi.hoisted(() => vi.fn());
 const publishStoredTelegramMediaMock = vi.hoisted(() => vi.fn());
+const chatClientMock = vi.hoisted(() => ({
+  connect: vi.fn(),
+  getChannels: vi.fn(),
+  join: vi.fn(),
+  on: vi.fn(),
+}));
 const prismaMock = vi.hoisted(() => ({
   streamer: {
     findMany: vi.fn(),
@@ -89,7 +95,14 @@ vi.mock("./telegram-storage.js", () => ({
 }));
 
 vi.mock("tmi.js", () => ({
-  default: { Client: class {} },
+  default: {
+    Client: class {
+      connect = chatClientMock.connect;
+      getChannels = chatClientMock.getChannels;
+      join = chatClientMock.join;
+      on = chatClientMock.on;
+    },
+  },
 }));
 
 vi.mock("ws", () => ({
@@ -148,6 +161,37 @@ describe("twitch chat command filtering", () => {
     expect(stripSkipTelegramPublicTag("look !skip_tg now")).toBe("look now");
     expect(stripSkipTelegramPublicTag("!skip_tghttps://example.com/a.jpg")).toBe("https://example.com/a.jpg");
     expect(stripSkipTelegramPublicTag("https://example.com/a.jpg!skip_tg")).toBe("https://example.com/a.jpg");
+  });
+});
+
+describe("twitch chat membership", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-11T20:00:00Z"));
+    envMock.TWITCH_CHANNELS = "streamer,ahmad153";
+    chatClientMock.connect.mockResolvedValue(["irc-ws.chat.twitch.tv", 443]);
+    chatClientMock.getChannels.mockReturnValue(["#streamer"]);
+    chatClientMock.join.mockResolvedValue(["#ahmad153"]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    envMock.TWITCH_CHANNELS = "streamer";
+  });
+
+  it("rejoins a configured channel missing from the active chat connection", async () => {
+    const { ensureChatConnected } = await import("./twitch.js");
+    await ensureChatConnected();
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await ensureChatConnected();
+    expect(chatClientMock.join).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await ensureChatConnected();
+    expect(chatClientMock.join).toHaveBeenCalledWith("ahmad153");
   });
 });
 
