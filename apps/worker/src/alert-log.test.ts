@@ -55,6 +55,7 @@ describe("operational alert logging", () => {
       alert_component: "wtv",
       alert_context: "channel=mishamedvedka",
       error_code: "dns",
+      alert_detail: "Error | getaddrinfo EAI_AGAIN profiles-service.w.tv | EAI_AGAIN",
     });
   });
 

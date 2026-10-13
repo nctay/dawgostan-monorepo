@@ -15,6 +15,7 @@ type ServiceAlert = {
 export function logServiceAlert(alert: ServiceAlert): void {
   const classified = classifyOperationalError(alert.error);
   const severity = alert.severity ?? (classified.code === "access_denied" ? "action" : "warning");
+  const errorText = operationalErrorText(alert.error);
   console.error(
     JSON.stringify({
       alert_code: alert.code,
@@ -24,7 +25,8 @@ export function logServiceAlert(alert: ServiceAlert): void {
       alert_component: alert.component,
       ...(alert.context ? { alert_context: alert.context } : {}),
       error_code: alert.errorCode ?? classified.code,
-      error_message: operationalErrorText(alert.error).slice(0, 2_000),
+      error_message: errorText.slice(0, 2_000),
+      alert_detail: errorText.replace(/\s+/g, " ").slice(0, 300),
       ...(alert.details ? { details: alert.details } : {}),
     }),
   );

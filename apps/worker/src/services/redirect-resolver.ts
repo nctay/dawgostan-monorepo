@@ -25,6 +25,7 @@ export async function resolveSupportedMediaUrl(rawUrl: string): Promise<string |
       component: "url-resolver",
       context: `host=${toUrl(rawUrl)?.hostname ?? "unknown"}`,
       error,
+      details: { url: rawUrl },
     });
     return null;
   }

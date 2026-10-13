@@ -9,6 +9,7 @@ type BotAlertInput = {
 
 export function logBotAlert(input: BotAlertInput): void {
   const classified = classifyBotError(input.error);
+  const errorText = botErrorText(input.error);
   console.error(
     JSON.stringify({
       alert_code: input.code ?? "telegram_bot_error",
@@ -18,7 +19,8 @@ export function logBotAlert(input: BotAlertInput): void {
       alert_component: "telegram",
       alert_context: `scope=${input.scope}`,
       error_code: classified.code,
-      error_message: botErrorText(input.error).slice(0, 2_000),
+      error_message: errorText.slice(0, 2_000),
+      alert_detail: errorText.replace(/\s+/g, " ").slice(0, 300),
       ...(input.details ? { details: input.details } : {}),
     }),
   );

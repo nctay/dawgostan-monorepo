@@ -1,0 +1,9 @@
+{{- range .Alerts -}}
+{{ if eq .Status "firing" }}🔴{{ else }}✅{{ end }} {{ or (index .Labels "alert_title") (index .Annotations "summary") (index .Labels "alertname") }}
+{{ with index .Labels "details_url" }}Ссылка: {{ . }}
+{{ else }}{{ with index .Labels "alert_context" }}Где: {{ . }}
+{{ end }}{{ end }}{{ with index .Labels "alert_detail" }}Ошибка: {{ . }}
+{{ else }}{{ with index .Labels "alert_reason" }}Причина: {{ . }}
+{{ else }}{{ with index .Annotations "description" }}{{ . }}
+{{ end }}{{ end }}{{ end }}
+{{ end -}}

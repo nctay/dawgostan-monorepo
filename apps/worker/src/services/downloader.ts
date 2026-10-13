@@ -217,6 +217,7 @@ async function processOneJob(): Promise<void> {
         details: {
           job_id: job.id,
           asset_id: job.assetId,
+          url: job.url,
           attempts: currentAttempts,
           streamer: job.chatPost.streamSession.streamer.login,
         },

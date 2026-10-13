@@ -23,6 +23,7 @@ describe("bot alert logging", () => {
       alert_context: "scope=public-bot",
       alert_severity: "action",
       error_code: "access_denied",
+      alert_detail: "Forbidden | 403",
     });
   });
 });

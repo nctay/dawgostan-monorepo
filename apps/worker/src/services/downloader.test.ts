@@ -94,6 +94,7 @@ describe("download failure cleanup", () => {
       alert_code: "download_failed",
       alert_title: "Не удалось скачать медиа",
       alert_context: "platform=unknown",
+      details: { url: "not-a-url" },
     });
   });
 
