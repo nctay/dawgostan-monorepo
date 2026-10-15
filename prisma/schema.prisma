@@ -183,6 +183,7 @@ model Asset {
   telegramFileUniqueId String?
   publicTelegramChatId String?
   publicTelegramMessageId Int?
+  publicTelegramPublishedAt DateTime?
   publicHasSpoiler     Boolean         @default(false)
   telegramIsAnimation  Boolean         @default(false)
   s3Key                String?

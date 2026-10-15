@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({ sendPhoto: vi.fn(), sendVideo: vi.fn(), sendAnimation: vi.fn(), sendMediaGroup: vi.fn(), copyMessage: vi.fn() }));
 const inputFileMock = vi.hoisted(() => vi.fn());
-const prismaMock = vi.hoisted(() => ({ asset: { updateMany: vi.fn() } }));
+const prismaMock = vi.hoisted(() => ({ asset: { updateMany: vi.fn(), update: vi.fn() } }));
 
 vi.mock("grammy", () => ({
   Bot: class {
@@ -34,6 +34,8 @@ vi.mock("./rate-limit.js", () => ({
 describe("Telegram media spoilers", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    prismaMock.asset.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.asset.update.mockResolvedValue({});
     apiMock.sendPhoto.mockResolvedValue({
       chat: { id: -100 },
       message_id: 1,
@@ -190,6 +192,41 @@ describe("Telegram media spoilers", () => {
     expect(apiMock.copyMessage).not.toHaveBeenCalled();
   });
 
+  it("does not claim a public post for a private streamer", async () => {
+    const { privateStreamerLogins } = await import("../env.js");
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+    privateStreamerLogins.add("nctay");
+    try {
+      await publishStoredTelegramMedia(
+        {
+          id: "asset",
+          visibility: "public",
+          telegramChatId: "-100storage",
+          telegramMessageId: 1,
+          telegramFileId: "file",
+          telegramIsAnimation: false,
+          publicHasSpoiler: false,
+          mimeType: "image/jpeg",
+          mediaType: "image",
+          publicTelegramChatId: null,
+          publicTelegramMessageId: null,
+        },
+        {
+          streamerLogin: "nctay",
+          streamStartedAt: new Date("2026-10-15T11:00:00Z"),
+          authorName: "Viewer",
+          messageText: "https://example.com/image.jpg",
+          skipTelegramPublic: false,
+        },
+      );
+    } finally {
+      privateStreamerLogins.delete("nctay");
+    }
+
+    expect(prismaMock.asset.updateMany).not.toHaveBeenCalled();
+    expect(apiMock.copyMessage).not.toHaveBeenCalled();
+  });
+
   it("resends a public photo by file_id with a spoiler", async () => {
     const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
 
@@ -296,5 +333,94 @@ describe("Telegram media spoilers", () => {
       1,
       expect.objectContaining({ caption: expect.stringContaining("#user_乃仨尸工丂") }),
     );
+  });
+
+  it("publishes an old repeat but suppresses another publication within 48 hours", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-15T12:00:00Z"));
+    try {
+      const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+      const asset = {
+        id: "asset",
+        visibility: "public" as const,
+        telegramChatId: "-100storage",
+        telegramMessageId: 1,
+        telegramFileId: "file",
+        telegramIsAnimation: false,
+        publicHasSpoiler: false,
+        mimeType: "image/jpeg",
+        mediaType: "image",
+        publicTelegramChatId: "-100public",
+        publicTelegramMessageId: 42,
+      };
+      const metadata = {
+        streamerLogin: "streamer",
+        streamStartedAt: new Date("2026-10-15T11:00:00Z"),
+        authorName: "Viewer",
+        messageText: "https://example.com/image.jpg",
+        skipTelegramPublic: false,
+      };
+      apiMock.copyMessage.mockResolvedValue({ message_id: 43 });
+      prismaMock.asset.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
+
+      await publishStoredTelegramMedia(asset, metadata);
+      await publishStoredTelegramMedia(asset, metadata);
+
+      expect(prismaMock.asset.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: "asset",
+          visibility: "public",
+          OR: [
+            { publicTelegramPublishedAt: null },
+            { publicTelegramPublishedAt: { lte: new Date("2026-10-13T12:00:00Z") } },
+          ],
+        },
+        data: { publicTelegramPublishedAt: new Date("2026-10-15T12:00:00Z") },
+      });
+      expect(apiMock.copyMessage).toHaveBeenCalledTimes(1);
+      expect(prismaMock.asset.update).toHaveBeenCalledWith({
+        where: { id: "asset" },
+        data: {
+          publicTelegramChatId: "-100public",
+          publicTelegramMessageId: 43,
+          publicTelegramPublishedAt: new Date("2026-10-15T12:00:00Z"),
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases the publication claim when Telegram rejects the send", async () => {
+    apiMock.copyMessage.mockRejectedValue(new Error("Telegram unavailable"));
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+    const asset = {
+      id: "asset",
+      visibility: "public" as const,
+      telegramChatId: "-100storage",
+      telegramMessageId: 1,
+      telegramFileId: "file",
+      telegramIsAnimation: false,
+      publicHasSpoiler: false,
+      mimeType: "image/jpeg",
+      mediaType: "image",
+      publicTelegramChatId: null,
+      publicTelegramMessageId: null,
+    };
+
+    await expect(publishStoredTelegramMedia(asset, {
+      streamerLogin: "streamer",
+      streamStartedAt: new Date("2026-10-15T11:00:00Z"),
+      authorName: "Viewer",
+      messageText: "https://example.com/image.jpg",
+      skipTelegramPublic: false,
+    })).rejects.toThrow("Telegram unavailable");
+
+    expect(prismaMock.asset.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.asset.updateMany.mock.calls[1]?.[0]).toEqual({
+      where: { id: "asset", publicTelegramPublishedAt: expect.any(Date) },
+      data: { publicTelegramPublishedAt: null },
+    });
+    expect(prismaMock.asset.update).not.toHaveBeenCalled();
   });
 });

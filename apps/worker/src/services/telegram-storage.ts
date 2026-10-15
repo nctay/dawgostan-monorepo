@@ -151,18 +151,44 @@ export async function publishStoredTelegramMedia(
   },
   metadata: PublicTelegramMediaMetadata,
 ): Promise<void> {
-  if (!asset.telegramChatId || !asset.telegramMessageId || asset.publicTelegramMessageId) return;
+  if (!asset.telegramChatId || !asset.telegramMessageId) return;
   if (asset.visibility === "hidden") {
     console.log(`[telegram] skip public channel hidden_asset=${asset.id}`);
     return;
   }
+  if (metadata.skipTelegramPublic) {
+    console.log(`[telegram] skip public channel user_tag streamer=${metadata.streamerLogin}`);
+    return;
+  }
+  if (!env.TELEGRAM_PUBLIC_CHANNEL_ID) return;
+  if (privateStreamerLogins.has(metadata.streamerLogin.toLowerCase())) {
+    console.log(`[telegram] skip public channel private_streamer=${metadata.streamerLogin}`);
+    return;
+  }
 
-  const copied = await publishTelegramMedia(asset, metadata);
-  if (!copied) return;
+  const claimedAt = new Date();
+  const cutoff = new Date(claimedAt.getTime() - 48 * 60 * 60 * 1000);
+  // shortcut: a crash after this claim can suppress an unsent post for 48 hours; add a lease if this occurs.
+  const claim = await prisma.asset.updateMany({
+    where: { id: asset.id, visibility: "public", OR: [{ publicTelegramPublishedAt: null }, { publicTelegramPublishedAt: { lte: cutoff } }] },
+    data: { publicTelegramPublishedAt: claimedAt },
+  });
+  if (!claim.count) return;
 
-  await prisma.asset.updateMany({
-    where: { id: asset.id, publicTelegramMessageId: null },
-    data: { publicTelegramChatId: copied.telegramChatId, publicTelegramMessageId: copied.telegramMessageId },
+  let copied: { telegramChatId: string; telegramMessageId: number };
+  try {
+    copied = await publishTelegramMedia(asset, metadata);
+  } catch (error) {
+    await prisma.asset.updateMany({
+      where: { id: asset.id, publicTelegramPublishedAt: claimedAt },
+      data: { publicTelegramPublishedAt: null },
+    });
+    throw error;
+  }
+
+  await prisma.asset.update({
+    where: { id: asset.id },
+    data: { publicTelegramChatId: copied.telegramChatId, publicTelegramMessageId: copied.telegramMessageId, publicTelegramPublishedAt: new Date() },
   });
 }
 
@@ -230,21 +256,11 @@ function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-async function publishTelegramMedia(asset: TelegramStoredAsset, metadata: PublicTelegramMediaMetadata): Promise<{ telegramChatId: string; telegramMessageId: number } | null> {
-  if (metadata.skipTelegramPublic) {
-    console.log(`[telegram] skip public channel user_tag streamer=${metadata.streamerLogin}`);
-    return null;
-  }
-  if (!env.TELEGRAM_PUBLIC_CHANNEL_ID) return null;
-  if (privateStreamerLogins.has(metadata.streamerLogin.toLowerCase())) {
-    console.log(`[telegram] skip public channel private_streamer=${metadata.streamerLogin}`);
-    return null;
-  }
-
+async function publishTelegramMedia(asset: TelegramStoredAsset, metadata: PublicTelegramMediaMetadata): Promise<{ telegramChatId: string; telegramMessageId: number }> {
   const copied = await publicChannelSendLimiter.schedule(() =>
     sendStoredTelegramMedia(env.TELEGRAM_PUBLIC_CHANNEL_ID!, asset, publicChannelCaption(metadata)),
   );
-  return { telegramChatId: env.TELEGRAM_PUBLIC_CHANNEL_ID, telegramMessageId: copied.message_id };
+  return { telegramChatId: env.TELEGRAM_PUBLIC_CHANNEL_ID!, telegramMessageId: copied.message_id };
 }
 
 async function sendStoredTelegramMedia(chatId: string, asset: TelegramStoredAsset, caption: string): Promise<{ message_id: number }> {
