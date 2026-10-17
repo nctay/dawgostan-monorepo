@@ -355,14 +355,19 @@ async function withShaLock<T>(sha256: string, task: () => Promise<T>): Promise<T
 }
 
 async function downloadMedia(rawUrl: string): Promise<DownloadResult[]> {
-  if (isPlatformMediaUrl(rawUrl)) {
-    return [await downloadPlatformVideo(rawUrl)];
+  let platformUrl = toUrl(rawUrl);
+  if (platformUrl && ["vm.tiktok.com", "vt.tiktok.com"].includes(platformUrl.hostname.toLowerCase())) {
+    platformUrl = await resolveTikTokShortUrl(platformUrl);
   }
-  const pageUrl = toUrl(rawUrl);
+  if (platformUrl && isPlatformMediaUrl(platformUrl.toString()) && !/^\/@[^/]+\/photo\/\d+\/?$/.test(platformUrl.pathname)) {
+    return [await downloadPlatformVideo(platformUrl.toString())];
+  }
+  const pageUrl = platformUrl;
   if (!pageUrl) throw new Error("Invalid media URL");
   const urls = await resolveMediaPageUrls(pageUrl);
-  if (urls.length > telegramMediaGroupMaxItems) {
-    throw new MediaDownloadRejectedError(`Media album has too many items: ${urls.length} > ${telegramMediaGroupMaxItems}`);
+  const maxItems = ["tiktok.com", "www.tiktok.com"].includes(pageUrl.hostname.toLowerCase()) && pageUrl.pathname.includes("/photo/") ? 35 : telegramMediaGroupMaxItems;
+  if (urls.length > maxItems) {
+    throw new MediaDownloadRejectedError(`Media album has too many items: ${urls.length} > ${maxItems}`);
   }
   const downloads: DownloadResult[] = [];
   let totalBytes = 0;
@@ -391,21 +396,6 @@ async function downloadDirectMedia(initialUrl: URL): Promise<DownloadResult> {
 
   for (let redirects = 0; redirects <= 4; redirects += 1) {
     await assertSafeNetworkTarget(url);
-    const head = await fetch(url, { method: "HEAD", redirect: "manual" });
-    if (isRedirect(head.status)) {
-      url = redirectUrl(url, head);
-      continue;
-    }
-
-    const urlMediaType = mediaTypeFromUrl(url.toString());
-    const contentMediaType = mediaTypeFromContentType(head.headers.get("content-type"));
-    const mediaType = contentMediaType !== "other" ? contentMediaType : urlMediaType;
-    if (mediaType === "other") throw new Error("URL does not point to supported media");
-
-    const limit = maxBytesForMediaType(mediaType, env.MAX_IMAGE_BYTES, env.MAX_VIDEO_BYTES);
-    const contentLength = Number(head.headers.get("content-length") ?? "0");
-    if (contentLength > limit) throw new Error(`Media is too large: ${contentLength} > ${limit}`);
-
     const get = await fetch(url, { redirect: "manual" });
     if (isRedirect(get.status)) {
       url = redirectUrl(url, get);
@@ -413,7 +403,19 @@ async function downloadDirectMedia(initialUrl: URL): Promise<DownloadResult> {
     }
     if (!get.ok || !get.body) throw new Error(`GET failed with ${get.status}`);
 
-    const mimeType = get.headers.get("content-type")?.split(";")[0]?.trim() || head.headers.get("content-type") || "application/octet-stream";
+    const urlMediaType = mediaTypeFromUrl(url.toString());
+    const contentMediaType = mediaTypeFromContentType(get.headers.get("content-type"));
+    const mediaType = contentMediaType !== "other" ? contentMediaType : urlMediaType;
+    if (mediaType === "other") throw new Error("URL does not point to supported media");
+
+    const limit = maxBytesForMediaType(mediaType, env.MAX_IMAGE_BYTES, env.MAX_VIDEO_BYTES);
+    const contentLength = Number(get.headers.get("content-length") ?? "0");
+    if (contentLength > limit) {
+      await get.body.cancel();
+      throw new Error(`Media is too large: ${contentLength} > ${limit}`);
+    }
+
+    const mimeType = get.headers.get("content-type")?.split(";")[0]?.trim() || "application/octet-stream";
     const actualMediaType = mediaTypeFromContentType(mimeType);
     const finalMediaType = actualMediaType !== "other" ? actualMediaType : mediaType;
     if (finalMediaType !== "image" && finalMediaType !== "video") throw new Error(`Unsupported content type: ${mimeType}`);
@@ -446,6 +448,10 @@ async function downloadDirectMedia(initialUrl: URL): Promise<DownloadResult> {
 }
 
 async function resolveMediaPageUrls(url: URL): Promise<URL[]> {
+  if (["tiktok.com", "www.tiktok.com"].includes(url.hostname.toLowerCase()) && /^\/@[^/]+\/photo\/\d+\/?$/.test(url.pathname)) {
+    if (!env.ENABLE_PLATFORM_DOWNLOADS) throw new Error("Platform downloads are disabled");
+    return extractTikTokPhotoUrls(url);
+  }
   if (isYandexDiskUrl(url.toString())) {
     const directUrl = await resolveYandexDiskMediaUrl(url, env.MAX_IMAGE_BYTES, env.MAX_VIDEO_BYTES);
     await assertSafeNetworkTarget(directUrl);
@@ -474,6 +480,52 @@ async function resolveMediaPageUrls(url: URL): Promise<URL[]> {
   }
 
   throw new Error("Too many media page redirects");
+}
+
+async function resolveTikTokShortUrl(initialUrl: URL): Promise<URL> {
+  let url = initialUrl;
+  for (let redirects = 0; redirects <= 4; redirects += 1) {
+    await assertSafeNetworkTarget(url);
+    const response = await fetch(url, { method: "HEAD", redirect: "manual", headers: { "user-agent": "facebookexternalhit/1.1" } });
+    if (!isRedirect(response.status)) throw new Error(`TikTok short link failed with ${response.status}`);
+    url = redirectUrl(url, response);
+    if (!isPlatformMediaUrl(url.toString())) throw new Error("TikTok short link resolved to unsupported URL");
+    if (["tiktok.com", "www.tiktok.com"].includes(url.hostname.toLowerCase()) && /^\/@[^/]+\/(?:photo|video)\/\d+\/?$/.test(url.pathname)) {
+      url.search = "";
+      url.hash = "";
+      return url;
+    }
+  }
+  throw new Error("Too many TikTok redirects");
+}
+
+async function extractTikTokPhotoUrls(url: URL): Promise<URL[]> {
+  await assertSafeNetworkTarget(url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), env.PLATFORM_DOWNLOAD_TIMEOUT_MS);
+  try {
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = spawn("gallery-dl", ["--config-ignore", "-g", "-o", "extractor.tiktok.audio=false", url.toString()], {
+        stdio: ["ignore", "pipe", "pipe"],
+        signal: controller.signal,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+      child.on("error", reject);
+      child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`gallery-dl failed: ${stderr.trim() || `exit code ${code}`}`)));
+    });
+    const urls = output.trim().split("\n").filter(Boolean).map((value) => toUrl(value));
+    if (urls.length === 0) throw new Error("TikTok photo post has no images (TikTok may have blocked access)");
+    if (urls.some((item) => !item)) throw new Error("TikTok photo post returned an invalid image URL");
+    return urls as URL[];
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`gallery-dl timed out after ${env.PLATFORM_DOWNLOAD_TIMEOUT_MS}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {

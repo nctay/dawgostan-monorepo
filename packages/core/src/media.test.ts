@@ -17,6 +17,7 @@ describe("media helpers", () => {
 
   it("detects supported platform video URLs", () => {
     expect(isSupportedMediaUrl("https://www.tiktok.com/@example/video/1234567890")).toBe(true);
+    expect(isSupportedMediaUrl("https://www.tiktok.com/@example/photo/1234567890")).toBe(true);
     expect(isSupportedMediaUrl("https://vm.tiktok.com/ZMabcdef/")).toBe(true);
     expect(isSupportedMediaUrl("https://www.tiktok.com/@example")).toBe(false);
     expect(isSupportedMediaUrl("https://www.tiktok.com/@example/")).toBe(false);

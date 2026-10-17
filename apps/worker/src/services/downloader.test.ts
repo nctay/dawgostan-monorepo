@@ -187,6 +187,45 @@ if (args.includes("--dump-json")) {
     }
   });
 
+  it("stores all 18 images from a TikTok photo post", async () => {
+    const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-test-bin-"));
+    const previousPath = process.env.PATH;
+    await fs.promises.writeFile(path.join(binDir, "gallery-dl"), `#!/usr/bin/env node
+process.stdout.write(Array.from({ length: 18 }, (_, index) => "https://cdn.example/" + index + ".jpg").join("\\n") + "\\n");
+`, { mode: 0o755 });
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+    prismaMock.downloadJob.findUnique.mockResolvedValue({
+      ...(await prismaMock.downloadJob.findUnique()),
+      url: "https://vt.tiktok.com/ZSgjhmxsJ/",
+    });
+    storeTelegramMediaGroupMock.mockResolvedValue({
+      storageProvider: "telegram", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramMessageIds: [1, 2], telegramFileId: "file", telegramFileIds: ["file", "file2"], telegramFileUniqueId: "unique",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input).startsWith("https://vt.tiktok.com/")) {
+        return new Response(null, { status: 301, headers: { location: "https://www.tiktok.com/@ertz_aethe/photo/7677117145024777493" } });
+      }
+      if (init?.method === "HEAD") return new Response(null, { headers: { "content-type": "image/jpeg", "content-length": "12" } });
+      return new Response("fixture-photo", { headers: { "content-type": "image/jpeg" } });
+    });
+
+    try {
+      const { processDownloadQueue } = await import("./downloader.js");
+      await processDownloadQueue();
+
+      expect(storeTelegramMediaGroupMock).toHaveBeenCalledWith(expect.arrayContaining([
+        expect.objectContaining({ mimeType: "image/jpeg" }),
+      ]), expect.objectContaining({ originalUrl: "https://vt.tiktok.com/ZSgjhmxsJ/" }));
+      expect(storeTelegramMediaGroupMock.mock.calls[0]?.[0]).toHaveLength(18);
+      expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+      process.env.PATH = previousPath;
+      await fs.promises.rm(binDir, { force: true, recursive: true });
+    }
+  });
+
   it("does not retry or error-log a platform video rejected by the duration limit", async () => {
     const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-test-bin-"));
     const ytDlpPath = path.join(binDir, "yt-dlp");

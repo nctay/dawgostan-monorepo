@@ -141,12 +141,15 @@ describe("Telegram media spoilers", () => {
     expect(stored.telegramFileIds).toEqual(["file-1", "file-2"]);
   });
 
-  it("rejects albums larger than one Telegram media group before upload", async () => {
+  it("stores 18 photos in two Telegram groups", async () => {
     const { storeTelegramMediaGroup } = await import("./telegram-storage.js");
-    const files = Array.from({ length: 11 }, () => ({ filePath: "/dev/null", mimeType: "image/webp" }));
+    const files = Array.from({ length: 18 }, () => ({ filePath: "/dev/null", mimeType: "image/webp" }));
+    let nextId = 1;
+    apiMock.sendMediaGroup.mockImplementation(async (_chatId, media: unknown[]) => media.map(() => ({
+      chat: { id: -100 }, message_id: nextId++, photo: [{ file_id: `file-${nextId}`, file_unique_id: `unique-${nextId}` }],
+    })));
 
-    await expect(
-      storeTelegramMediaGroup(files, {
+    const stored = await storeTelegramMediaGroup(files, {
         originalUrl: "https://eblo.id/album",
         normalizedUrl: "https://eblo.id/album",
         sha256: "hash",
@@ -158,9 +161,11 @@ describe("Telegram media spoilers", () => {
         authorName: "Viewer",
         messageText: "https://eblo.id/album",
         skipTelegramPublic: false,
-      }),
-    ).rejects.toThrow("at most 10 files");
-    expect(apiMock.sendMediaGroup).not.toHaveBeenCalled();
+      });
+    expect(apiMock.sendMediaGroup).toHaveBeenCalledTimes(2);
+    expect(apiMock.sendMediaGroup.mock.calls.map((call) => call[1].length)).toEqual([10, 8]);
+    expect(stored.telegramMessageIds).toHaveLength(18);
+    expect(stored.telegramFileIds).toHaveLength(18);
   });
 
   it("does not publish hidden assets", async () => {
@@ -298,6 +303,28 @@ describe("Telegram media spoilers", () => {
       ],
     );
     expect(apiMock.copyMessage).not.toHaveBeenCalled();
+  });
+
+  it("publishes all 18 stored photos in two groups", async () => {
+    apiMock.sendMediaGroup.mockImplementation(async (_chatId, media: unknown[]) => media.map((_, index) => ({ message_id: 20 + index })));
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+
+    await publishStoredTelegramMedia(
+      {
+        id: "asset", visibility: "public", telegramChatId: "-100storage", telegramMessageId: 1,
+        telegramFileId: "file-1", telegramFileIds: Array.from({ length: 18 }, (_, index) => `file-${index + 1}`),
+        telegramIsAnimation: false, publicHasSpoiler: false, mimeType: "image/jpeg", mediaType: "image",
+        publicTelegramChatId: null, publicTelegramMessageId: null,
+      },
+      {
+        streamerLogin: "streamer", streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        authorName: "Viewer", messageText: "https://vt.tiktok.com/example/", skipTelegramPublic: false,
+      },
+    );
+
+    expect(apiMock.sendMediaGroup.mock.calls.map((call) => call[1].length)).toEqual([10, 8]);
+    expect(apiMock.sendMediaGroup.mock.calls[0]?.[1][0]).toHaveProperty("caption", expect.stringContaining("#streamer_stream"));
+    expect(apiMock.sendMediaGroup.mock.calls[1]?.[1][0]).not.toHaveProperty("caption");
   });
 
   it("keeps Unicode letters in the public sender hashtag", async () => {

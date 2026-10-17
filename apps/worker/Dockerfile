@@ -23,7 +23,7 @@ FROM base AS runtime
 ENV NODE_ENV=production
 RUN apk add --no-cache ffmpeg imagemagick python3 py3-pip \
     && python3 -m venv /opt/yt-dlp \
-    && /opt/yt-dlp/bin/pip install --no-cache-dir 'yt-dlp[default]==2026.8.30.232658.dev0'
+    && /opt/yt-dlp/bin/pip install --no-cache-dir 'yt-dlp[default]==2026.8.30.232658.dev0' 'gallery-dl==1.32.16'
 ENV PATH="/opt/yt-dlp/bin:${PATH}"
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json

@@ -108,7 +108,6 @@ export async function storeTelegramMedia(filePath: string, mimeType: string, med
 export async function storeTelegramMediaGroup(files: Array<{ filePath: string; mimeType: string }>, metadata: StoreMediaMetadata): Promise<StoredMedia> {
   if (!env.TELEGRAM_STORAGE_CHAT_ID) throw new Error("TELEGRAM_STORAGE_CHAT_ID is not configured");
   if (files.length < 2) throw new Error("Telegram media group requires at least two files");
-  if (files.length > telegramMediaGroupMaxItems) throw new Error(`Telegram media group supports at most ${telegramMediaGroupMaxItems} files`);
 
   const caption = [
     `streamer=${metadata.streamerLogin}`,
@@ -117,16 +116,22 @@ export async function storeTelegramMediaGroup(files: Array<{ filePath: string; m
     `sha256=${metadata.sha256}`,
     metadata.normalizedUrl,
   ].join("\n");
-  const messages = (await storageSendLimiter.schedule(() =>
-    telegramBot().api.sendMediaGroup(
-      env.TELEGRAM_STORAGE_CHAT_ID!,
-      files.map((file, index) => ({
-        type: "photo" as const,
-        media: new InputFile(file.filePath, fileName(file.filePath, file.mimeType, "image")),
-        ...(index === 0 ? { caption } : {}),
-      })),
-    ),
-  )) as Message.PhotoMessage[];
+  const messages: Message.PhotoMessage[] = [];
+  for (let offset = 0; offset < files.length; offset += telegramMediaGroupMaxItems) {
+    const batch = files.slice(offset, offset + telegramMediaGroupMaxItems);
+    if (batch.length === 1) {
+      messages.push(await storageSendLimiter.schedule(() => telegramBot().api.sendPhoto(
+        env.TELEGRAM_STORAGE_CHAT_ID!, new InputFile(batch[0]!.filePath, fileName(batch[0]!.filePath, batch[0]!.mimeType, "image")), offset === 0 ? { caption } : {},
+      )));
+    } else {
+      const sent = await storageSendLimiter.schedule(() => telegramBot().api.sendMediaGroup(env.TELEGRAM_STORAGE_CHAT_ID!, batch.map((file, index) => ({
+          type: "photo" as const,
+          media: new InputFile(file.filePath, fileName(file.filePath, file.mimeType, "image")),
+          ...(offset === 0 && index === 0 ? { caption } : {}),
+        }))));
+      messages.push(...sent as Message.PhotoMessage[]);
+    }
+  }
 
   const storedFiles = messages.map((message) => message.photo.at(-1)).filter((file): file is NonNullable<typeof file> => Boolean(file));
   if (messages.length !== files.length || storedFiles.length !== files.length) throw new Error("Telegram did not return all album file metadata");
@@ -266,18 +271,21 @@ async function publishTelegramMedia(asset: TelegramStoredAsset, metadata: Public
 async function sendStoredTelegramMedia(chatId: string, asset: TelegramStoredAsset, caption: string): Promise<{ message_id: number }> {
   const albumFileIds = asset.telegramFileIds ?? [];
   if (albumFileIds.length > 1) {
-    if (albumFileIds.length > telegramMediaGroupMaxItems) throw new Error(`Telegram media group supports at most ${telegramMediaGroupMaxItems} files`);
-    const messages = await telegramBot().api.sendMediaGroup(
-      chatId,
-      albumFileIds.map((fileId, index) => ({
-        type: "photo" as const,
-        media: fileId,
-        ...(index === 0 ? { caption } : {}),
-        ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}),
-      })),
-    );
-    if (!messages[0]) throw new Error("Telegram did not return a public album message");
-    return { message_id: messages[0].message_id };
+    let firstMessageId: number | undefined;
+    for (let offset = 0; offset < albumFileIds.length; offset += telegramMediaGroupMaxItems) {
+      const batch = albumFileIds.slice(offset, offset + telegramMediaGroupMaxItems);
+      const sent = batch.length === 1
+        ? await telegramBot().api.sendPhoto(chatId, batch[0]!, { ...(offset === 0 ? { caption } : {}), ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}) })
+        : await telegramBot().api.sendMediaGroup(chatId, batch.map((fileId, index) => ({
+            type: "photo" as const,
+            media: fileId,
+            ...(offset === 0 && index === 0 ? { caption } : {}),
+            ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}),
+          })));
+      firstMessageId ??= (Array.isArray(sent) ? sent[0] : sent)?.message_id;
+    }
+    if (!firstMessageId) throw new Error("Telegram did not return a public album message");
+    return { message_id: firstMessageId };
   }
   if (!asset.publicHasSpoiler) {
     return telegramBot().api.copyMessage(chatId, asset.telegramChatId!, asset.telegramMessageId!, { caption });
