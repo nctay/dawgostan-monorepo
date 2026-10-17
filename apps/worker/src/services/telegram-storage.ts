@@ -275,11 +275,11 @@ async function sendStoredTelegramMedia(chatId: string, asset: TelegramStoredAsse
     for (let offset = 0; offset < albumFileIds.length; offset += telegramMediaGroupMaxItems) {
       const batch = albumFileIds.slice(offset, offset + telegramMediaGroupMaxItems);
       const sent = batch.length === 1
-        ? await telegramBot().api.sendPhoto(chatId, batch[0]!, { ...(offset === 0 ? { caption } : {}), ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}) })
+        ? await telegramBot().api.sendPhoto(chatId, batch[0]!, { caption, ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}) })
         : await telegramBot().api.sendMediaGroup(chatId, batch.map((fileId, index) => ({
             type: "photo" as const,
             media: fileId,
-            ...(offset === 0 && index === 0 ? { caption } : {}),
+            ...(index === 0 ? { caption } : {}),
             ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}),
           })));
       firstMessageId ??= (Array.isArray(sent) ? sent[0] : sent)?.message_id;

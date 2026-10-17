@@ -324,7 +324,28 @@ describe("Telegram media spoilers", () => {
 
     expect(apiMock.sendMediaGroup.mock.calls.map((call) => call[1].length)).toEqual([10, 8]);
     expect(apiMock.sendMediaGroup.mock.calls[0]?.[1][0]).toHaveProperty("caption", expect.stringContaining("#streamer_stream"));
-    expect(apiMock.sendMediaGroup.mock.calls[1]?.[1][0]).not.toHaveProperty("caption");
+    expect(apiMock.sendMediaGroup.mock.calls[1]?.[1][0]).toHaveProperty("caption", expect.stringContaining("#streamer_stream"));
+    expect(apiMock.sendMediaGroup.mock.calls[1]?.[1][1]).not.toHaveProperty("caption");
+  });
+
+  it("includes a caption when the last batch contains one photo", async () => {
+    apiMock.sendMediaGroup.mockResolvedValue([{ message_id: 20 }]);
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+
+    await publishStoredTelegramMedia(
+      {
+        id: "asset", visibility: "public", telegramChatId: "-100storage", telegramMessageId: 1,
+        telegramFileId: "file-1", telegramFileIds: Array.from({ length: 11 }, (_, index) => `file-${index + 1}`),
+        telegramIsAnimation: false, publicHasSpoiler: false, mimeType: "image/jpeg", mediaType: "image",
+        publicTelegramChatId: null, publicTelegramMessageId: null,
+      },
+      {
+        streamerLogin: "streamer", streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        authorName: "Viewer", messageText: "https://vt.tiktok.com/example/", skipTelegramPublic: false,
+      },
+    );
+
+    expect(apiMock.sendPhoto).toHaveBeenCalledWith("-100public", "file-11", expect.objectContaining({ caption: expect.stringContaining("#streamer_stream") }));
   });
 
   it("keeps Unicode letters in the public sender hashtag", async () => {
