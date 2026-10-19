@@ -35,12 +35,14 @@ class MediaDownloadRejectedError extends Error {}
 
 export async function processDownloadQueue(): Promise<void> {
   const slots = Math.max(1, env.MAX_PARALLEL_DOWNLOADS);
-  await Promise.all(Array.from({ length: slots }, () => processOneJob()));
+  await Promise.all(Array.from({ length: slots }, async () => {
+    while (await processOneJob()) {}
+  }));
 }
 
-async function processOneJob(): Promise<void> {
+async function processOneJob(): Promise<boolean> {
   const job = await claimDownloadJob();
-  if (!job) return;
+  if (!job) return false;
   console.log(`[download] started job=${job.id} asset=${job.assetId ?? "none"} url=${job.url}`);
 
   try {
@@ -50,7 +52,7 @@ async function processOneJob(): Promise<void> {
     const blockedByUrl = await prisma.blockedMedia.findUnique({ where: { normalizedUrl } });
     if (blockedByUrl) {
       await markBlocked(job.id, job.chatPostId, "URL is blocked");
-      return;
+      return true;
     }
 
     const existingByUrl = await prisma.asset.findUnique({ where: { normalizedUrl } });
@@ -59,7 +61,7 @@ async function processOneJob(): Promise<void> {
       await markStoredReferences(existingStoredAsset.id, normalizedUrl, job.id, job.chatPostId, existingByUrl?.id ?? job.assetId);
       await publishStoredTelegramMedia(existingStoredAsset, publicMetadata(job));
       console.log(`[download] reused-stored job=${job.id} asset=${existingStoredAsset.id}`);
-      return;
+      return true;
     }
 
     await assertDailyLimitAvailable();
@@ -224,6 +226,7 @@ async function processOneJob(): Promise<void> {
       });
     }
   }
+  return true;
 }
 
 function mediaSource(rawUrl: string): string {

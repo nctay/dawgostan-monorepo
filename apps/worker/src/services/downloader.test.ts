@@ -54,7 +54,7 @@ describe("download failure cleanup", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
-    prismaMock.$queryRaw.mockResolvedValue([{ id: "job-1" }]);
+    prismaMock.$queryRaw.mockResolvedValueOnce([{ id: "job-1" }]).mockResolvedValue([]);
     prismaMock.downloadJob.findUnique.mockResolvedValue({
       id: "job-1",
       assetId: "asset-1",
@@ -98,6 +98,34 @@ describe("download failure cleanup", () => {
     });
   });
 
+  it("claims another job when one download slot is still busy", async () => {
+    const { env } = await import("../env.js");
+    const previousSlots = env.MAX_PARALLEL_DOWNLOADS;
+    env.MAX_PARALLEL_DOWNLOADS = 2;
+    const fixture = await prismaMock.downloadJob.findUnique();
+    let releaseSlow: () => void = () => undefined;
+    const slowJob = new Promise((resolve) => { releaseSlow = () => resolve({ ...fixture, id: "slow" }); });
+    prismaMock.$queryRaw.mockReset()
+      .mockResolvedValueOnce([{ id: "slow" }])
+      .mockResolvedValueOnce([{ id: "fast" }])
+      .mockResolvedValueOnce([{ id: "later" }])
+      .mockResolvedValue([]);
+    prismaMock.downloadJob.findUnique.mockImplementation(({ where }: { where: { id: string } }) =>
+      where.id === "slow" ? slowJob : Promise.resolve({ ...fixture, id: where.id }),
+    );
+    const { processDownloadQueue } = await import("./downloader.js");
+    const processing = processDownloadQueue();
+
+    try {
+      await vi.waitFor(() => expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(4));
+      expect(prismaMock.downloadJob.findUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { id: "later" } }));
+    } finally {
+      releaseSlow();
+      await processing;
+      env.MAX_PARALLEL_DOWNLOADS = previousSlots;
+    }
+  });
+
 });
 
 describe("platform download lifecycle", () => {
@@ -105,7 +133,7 @@ describe("platform download lifecycle", () => {
     vi.resetAllMocks();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "info").mockImplementation(() => undefined);
-    prismaMock.$queryRaw.mockResolvedValue([{ id: "job-1" }]);
+    prismaMock.$queryRaw.mockResolvedValueOnce([{ id: "job-1" }]).mockResolvedValue([]);
     prismaMock.downloadJob.findUnique.mockResolvedValue({
       id: "job-1",
       assetId: "asset-1",
@@ -266,7 +294,7 @@ describe("media album limits", () => {
     vi.resetAllMocks();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "info").mockImplementation(() => undefined);
-    prismaMock.$queryRaw.mockResolvedValue([{ id: "job-album" }]);
+    prismaMock.$queryRaw.mockResolvedValueOnce([{ id: "job-album" }]).mockResolvedValue([]);
     prismaMock.downloadJob.findUnique.mockResolvedValue({
       id: "job-album",
       assetId: "asset-album",
