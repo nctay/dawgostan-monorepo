@@ -28,6 +28,7 @@ type DownloadResult = {
 };
 
 const shaLocks = new Map<string, Promise<void>>();
+const activeDownloadSlots = new Set<Promise<void>>();
 const youtubeCookiesFile = "/run/private/youtube-cookies.txt";
 const telegramVideoMaxBytes = 49_900_000;
 
@@ -37,6 +38,8 @@ export async function recoverInterruptedDownloadJobs(): Promise<void> {
   const recovered = await prisma.downloadJob.updateMany({
     where: {
       status: "running",
+      // shortcut: jobs older than seven days need manual replay; add paced recovery if outages last longer.
+      updatedAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1_000) },
       asset: {
         is: {
           status: "pending",
@@ -54,11 +57,21 @@ export async function recoverInterruptedDownloadJobs(): Promise<void> {
   if (recovered.count) console.log(`[download] recovered interrupted jobs=${recovered.count}`);
 }
 
-export async function processDownloadQueue(): Promise<void> {
+export function processDownloadQueue(): void {
   const slots = Math.max(1, env.MAX_PARALLEL_DOWNLOADS);
-  await Promise.all(Array.from({ length: slots }, async () => {
-    while (await processOneJob()) {}
-  }));
+  while (activeDownloadSlots.size < slots) {
+    const task = (async () => { while (await processOneJob()) {} })();
+    activeDownloadSlots.add(task);
+    void task
+      .catch((error) =>
+        logServiceAlert({ code: "download_queue_failed", title: "Очередь загрузок остановилась", component: "downloader", severity: "critical", error }),
+      )
+      .finally(() => activeDownloadSlots.delete(task));
+  }
+}
+
+export async function waitForDownloadQueue(): Promise<void> {
+  await Promise.allSettled(activeDownloadSlots);
 }
 
 async function processOneJob(): Promise<boolean> {

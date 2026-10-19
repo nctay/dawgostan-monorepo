@@ -81,6 +81,7 @@ describe("download failure cleanup", () => {
     expect(prismaMock.downloadJob.updateMany).toHaveBeenCalledWith({
       where: {
         status: "running",
+        updatedAt: { gte: expect.any(Date) },
         asset: {
           is: {
             status: "pending",
@@ -98,9 +99,10 @@ describe("download failure cleanup", () => {
   });
 
   it("fails the asset and every pending post for the same URL after the last attempt", async () => {
-    const { processDownloadQueue } = await import("./downloader.js");
+    const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
 
-    await processDownloadQueue();
+    processDownloadQueue();
+    await waitForDownloadQueue();
 
     expect(prismaMock.chatPost.updateMany).toHaveBeenCalledWith({
       where: {
@@ -132,21 +134,25 @@ describe("download failure cleanup", () => {
     const slowJob = new Promise((resolve) => { releaseSlow = () => resolve({ ...fixture, id: "slow" }); });
     prismaMock.$queryRaw.mockReset()
       .mockResolvedValueOnce([{ id: "slow" }])
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ id: "fast" }])
       .mockResolvedValueOnce([{ id: "later" }])
       .mockResolvedValue([]);
     prismaMock.downloadJob.findUnique.mockImplementation(({ where }: { where: { id: string } }) =>
       where.id === "slow" ? slowJob : Promise.resolve({ ...fixture, id: where.id }),
     );
-    const { processDownloadQueue } = await import("./downloader.js");
-    const processing = processDownloadQueue();
+    const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+    processDownloadQueue();
 
     try {
-      await vi.waitFor(() => expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(4));
+      await vi.waitFor(() => {
+        processDownloadQueue();
+        expect(prismaMock.$queryRaw.mock.calls.length).toBeGreaterThanOrEqual(5);
+      });
       expect(prismaMock.downloadJob.findUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { id: "later" } }));
     } finally {
       releaseSlow();
-      await processing;
+      await waitForDownloadQueue();
       env.MAX_PARALLEL_DOWNLOADS = previousSlots;
     }
   });
@@ -223,9 +229,11 @@ if (args.includes("--dump-json")) {
     process.env.PATH = `${binDir}:${previousPath ?? ""}`;
 
     try {
-      const { processDownloadQueue } = await import("./downloader.js");
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
 
-      await processDownloadQueue();
+      processDownloadQueue();
+
+      await waitForDownloadQueue();
 
       expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
       expect(prismaMock.asset.upsert).toHaveBeenCalledWith(
@@ -264,8 +272,9 @@ process.stdout.write(Array.from({ length: 18 }, (_, index) => "https://cdn.examp
     });
 
     try {
-      const { processDownloadQueue } = await import("./downloader.js");
-      await processDownloadQueue();
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
 
       expect(storeTelegramMediaGroupMock).toHaveBeenCalledWith(expect.arrayContaining([
         expect.objectContaining({ mimeType: "image/jpeg" }),
@@ -293,9 +302,11 @@ process.stdout.write(JSON.stringify({ duration: 595, filesize: 13 }) + "\\n");
     process.env.PATH = `${binDir}:${previousPath ?? ""}`;
 
     try {
-      const { processDownloadQueue } = await import("./downloader.js");
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
 
-      await processDownloadQueue();
+      processDownloadQueue();
+
+      await waitForDownloadQueue();
 
       expect(prismaMock.downloadJob.update).toHaveBeenCalledWith({
         where: { id: "job-1" },
@@ -370,8 +381,9 @@ describe("media album limits", () => {
     }) as typeof fs.createWriteStream);
 
     try {
-      const { processDownloadQueue } = await import("./downloader.js");
-      await processDownloadQueue();
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
 
       expect(prismaMock.downloadJob.update).toHaveBeenCalledWith({
         where: { id: "job-album" },
@@ -396,8 +408,9 @@ describe("media album limits", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(html, { headers: { "content-type": "text/html" } }));
 
     try {
-      const { processDownloadQueue } = await import("./downloader.js");
-      await processDownloadQueue();
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
 
       expect(fetchMock).toHaveBeenCalledOnce();
       expect(prismaMock.downloadJob.update).toHaveBeenCalledWith({

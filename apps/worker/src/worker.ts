@@ -1,30 +1,17 @@
 import { cleanupExpiredChatMessages, ensureChatConnected, ensureEventSubConnected, pollTwitchStreams } from "./services/twitch.js";
 import { pollWtvStreams } from "./services/wtv.js";
-import { processDownloadQueue, recoverInterruptedDownloadJobs } from "./services/downloader.js";
+import { processDownloadQueue, recoverInterruptedDownloadJobs, waitForDownloadQueue } from "./services/downloader.js";
 import { prisma } from "./prisma.js";
 import { logServiceAlert } from "./alert-log.js";
 
 let shuttingDown = false;
-let downloadTask: Promise<void> | null = null;
 
 async function tick(): Promise<void> {
   ensureEventSubConnected();
   void ensureChatConnected().catch((error) =>
     logServiceAlert({ code: "twitch_chat_connect_failed", title: "Twitch-чат недоступен", component: "twitch-chat", error }),
   );
-  downloadTask ??= processDownloadQueue()
-    .catch((error) =>
-      logServiceAlert({
-        code: "download_queue_failed",
-        title: "Очередь загрузок остановилась",
-        component: "downloader",
-        severity: "critical",
-        error,
-      }),
-    )
-    .finally(() => {
-      downloadTask = null;
-    });
+  processDownloadQueue();
   const tasks = [
     { code: "twitch_poll_failed", title: "Не удалось проверить Twitch-стримы", component: "twitch", promise: pollTwitchStreams() },
     { code: "wtv_task_failed", title: "Не удалось проверить WTV-стримы", component: "wtv", promise: pollWtvStreams() },
@@ -54,5 +41,5 @@ process.on("SIGTERM", () => {
 
 await recoverInterruptedDownloadJobs();
 await loop();
-await downloadTask;
+await waitForDownloadQueue();
 await prisma.$disconnect();
