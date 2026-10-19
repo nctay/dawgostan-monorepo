@@ -72,6 +72,31 @@ describe("download failure cleanup", () => {
     prismaMock.$transaction.mockResolvedValue([]);
   });
 
+  it("recovers interrupted jobs only when Telegram has no stored media record", async () => {
+    const { recoverInterruptedDownloadJobs } = await import("./downloader.js");
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 1 });
+
+    await recoverInterruptedDownloadJobs();
+
+    expect(prismaMock.downloadJob.updateMany).toHaveBeenCalledWith({
+      where: {
+        status: "running",
+        asset: {
+          is: {
+            status: "pending",
+            sha256: null,
+            telegramMessageId: null,
+            telegramMessageIds: { isEmpty: true },
+            telegramFileId: null,
+            telegramFileIds: { isEmpty: true },
+            publicTelegramMessageId: null,
+          },
+        },
+      },
+      data: { status: "pending", nextRetryAt: null },
+    });
+  });
+
   it("fails the asset and every pending post for the same URL after the last attempt", async () => {
     const { processDownloadQueue } = await import("./downloader.js");
 

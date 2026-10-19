@@ -33,6 +33,27 @@ const telegramVideoMaxBytes = 49_900_000;
 
 class MediaDownloadRejectedError extends Error {}
 
+export async function recoverInterruptedDownloadJobs(): Promise<void> {
+  const recovered = await prisma.downloadJob.updateMany({
+    where: {
+      status: "running",
+      asset: {
+        is: {
+          status: "pending",
+          sha256: null,
+          telegramMessageId: null,
+          telegramMessageIds: { isEmpty: true },
+          telegramFileId: null,
+          telegramFileIds: { isEmpty: true },
+          publicTelegramMessageId: null,
+        },
+      },
+    },
+    data: { status: "pending", nextRetryAt: null },
+  });
+  if (recovered.count) console.log(`[download] recovered interrupted jobs=${recovered.count}`);
+}
+
 export async function processDownloadQueue(): Promise<void> {
   const slots = Math.max(1, env.MAX_PARALLEL_DOWNLOADS);
   await Promise.all(Array.from({ length: slots }, async () => {

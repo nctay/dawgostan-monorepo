@@ -1,6 +1,6 @@
 import { cleanupExpiredChatMessages, ensureChatConnected, ensureEventSubConnected, pollTwitchStreams } from "./services/twitch.js";
 import { pollWtvStreams } from "./services/wtv.js";
-import { processDownloadQueue } from "./services/downloader.js";
+import { processDownloadQueue, recoverInterruptedDownloadJobs } from "./services/downloader.js";
 import { prisma } from "./prisma.js";
 import { logServiceAlert } from "./alert-log.js";
 
@@ -52,6 +52,7 @@ process.on("SIGTERM", () => {
   shuttingDown = true;
 });
 
+await recoverInterruptedDownloadJobs();
 await loop();
 await downloadTask;
 await prisma.$disconnect();
