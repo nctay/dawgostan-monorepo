@@ -359,6 +359,46 @@ describe("media album limits", () => {
     prismaMock.$transaction.mockResolvedValue([]);
   });
 
+  it("stores both images from an Imgur album as one Telegram album", async () => {
+    const albumUrl = "https://imgur.com/a/123-sAUWwPJ";
+    classifyNsfwMock.mockResolvedValue({ publicSpoiler: false, status: "ok" });
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-album" });
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 0 });
+    publishStoredTelegramMediaMock.mockResolvedValue(undefined);
+    prismaMock.downloadJob.findUnique.mockResolvedValue({
+      ...(await prismaMock.downloadJob.findUnique()),
+      url: albumUrl,
+    });
+    storeTelegramMediaGroupMock.mockResolvedValue({
+      storageProvider: "telegram", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramMessageIds: [1, 2], telegramFileId: "file", telegramFileIds: ["file", "file2"], telegramFileUniqueId: "unique",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input) === "https://imgur.com/ajaxalbums/getimages/sAUWwPJ/hit.json") {
+        return Response.json({ success: true, data: { count: 2, images: [
+          { hash: "WgpOwku", ext: ".jpg" }, { hash: "8ND0DCy", ext: ".jpg" },
+        ] } });
+      }
+      if (init?.method === "HEAD") return new Response(null, { headers: { "content-type": "image/jpeg", "content-length": "12" } });
+      return new Response("fixture-photo", { headers: { "content-type": "image/jpeg" } });
+    });
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(fetchMock).toHaveBeenCalledWith("https://imgur.com/ajaxalbums/getimages/sAUWwPJ/hit.json", expect.anything());
+      expect(storeTelegramMediaGroupMock).toHaveBeenCalledWith(
+        [expect.objectContaining({ mimeType: "image/jpeg" }), expect.objectContaining({ mimeType: "image/jpeg" })],
+        expect.objectContaining({ originalUrl: albumUrl }),
+      );
+      expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("rejects an oversized album without retrying and removes every temp file", async () => {
     const payload = new Uint8Array(600_000);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {

@@ -39,6 +39,13 @@ describe("media helpers", () => {
     expect(isSupportedMediaUrl("https://eblo.id/@hokusmodertwitcha")).toBe(false);
   });
 
+  it("accepts Imgur albums but not unrelated Imgur pages", () => {
+    expect(isSupportedMediaUrl("https://imgur.com/a/123-sAUWwPJ")).toBe(true);
+    expect(isSupportedMediaUrl("https://imgur.com/a/sAUWwPJ")).toBe(true);
+    expect(isSupportedMediaUrl("https://imgur.com/user/example")).toBe(false);
+    expect(isSupportedMediaUrl("https://imgur.com.evil.com/a/sAUWwPJ")).toBe(false);
+  });
+
   it("accepts Yandex Disk public files but not arbitrary Disk pages", () => {
     expect(isSupportedMediaUrl("https://disk.yandex.ru/i/mkcCJXbMfEzTkw")).toBe(true);
     expect(isSupportedMediaUrl("https://disk.yandex.ru/d/abc123")).toBe(true);

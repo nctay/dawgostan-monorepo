@@ -9,7 +9,7 @@ export const ALLOWED_MEDIA_HOSTS = new Set([
   "i.ibb.co",
 ]);
 export const PLATFORM_MEDIA_HOSTS = new Set(["www.tiktok.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be"]);
-export const MEDIA_PAGE_HOSTS = new Set(["postimg.cc", "www.postimg.cc", "ibb.co", "www.ibb.co", "eblo.id", "www.eblo.id", "disk.yandex.ru", "yadi.sk"]);
+export const MEDIA_PAGE_HOSTS = new Set(["postimg.cc", "www.postimg.cc", "ibb.co", "www.ibb.co", "eblo.id", "www.eblo.id", "imgur.com", "www.imgur.com", "disk.yandex.ru", "yadi.sk"]);
 
 export const DEFAULT_MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 export const DEFAULT_MAX_VIDEO_BYTES = 100 * 1024 * 1024;
@@ -89,6 +89,7 @@ export function isMediaPageUrl(rawUrl: string): boolean {
   const hostname = url.hostname.toLowerCase();
   if (!MEDIA_PAGE_HOSTS.has(hostname)) return false;
   if (hostname === "disk.yandex.ru" || hostname === "yadi.sk") return isYandexDiskUrl(rawUrl);
+  if (hostname === "imgur.com" || hostname === "www.imgur.com") return /^\/a\/(?:[^/]+-)?[A-Za-z0-9]{5,12}\/?$/.test(url.pathname);
   const segments = url.pathname.split("/").filter(Boolean);
   if (hostname === "eblo.id" || hostname === "www.eblo.id") return segments.length === 1 && /^[A-Za-z0-9]{7}$/.test(segments[0] ?? "");
   return segments.length === 1 && segments[0] !== "gallery";

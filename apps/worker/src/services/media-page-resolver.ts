@@ -2,6 +2,21 @@ import { isMediaPageUrl, mediaTypeFromUrl } from "@dawgostan/core";
 
 const POSTIMAGE_CANDIDATE_URL = /https?:\/\/i\.postimg\.cc\/[^"' <>\]]+/gi;
 
+export function extractImgurAlbumUrls(payload: unknown): URL[] {
+  if (!payload || typeof payload !== "object") return [];
+  const response = payload as { success?: unknown; data?: { count?: unknown; images?: unknown } };
+  const images = response.data?.images;
+  if (response.success !== true || !Array.isArray(images) || !Number.isInteger(response.data?.count) || response.data?.count !== images.length || images.length === 0) return [];
+
+  const urls = images.map((image: unknown) => {
+    if (!image || typeof image !== "object") return null;
+    const { hash, ext } = image as { hash?: unknown; ext?: unknown };
+    if (typeof hash !== "string" || !/^[A-Za-z0-9]{5,12}$/.test(hash) || typeof ext !== "string" || !/^\.(?:jpe?g|png|gif|webp|avif|mp4|webm)$/i.test(ext)) return null;
+    return new URL(`https://i.imgur.com/${hash}${ext.toLowerCase()}`);
+  });
+  return urls.every((url): url is URL => Boolean(url)) ? urls : [];
+}
+
 export function extractPostimageDirectImageUrl(html: string, pageUrl: URL): URL | null {
   const url = extractMediaPageUrls(html, pageUrl)[0];
   return url && mediaTypeFromUrl(url.toString()) === "image" ? url : null;

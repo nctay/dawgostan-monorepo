@@ -12,7 +12,7 @@ import { prisma } from "../prisma.js";
 import { env } from "../env.js";
 import { assertPlatformMetadataFits, PlatformDownloadRejectedError, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
 import { publishStoredTelegramMedia, storeTelegramMedia, storeTelegramMediaGroup, telegramMediaGroupMaxItems } from "./telegram-storage.js";
-import { extractMediaPageUrls, isResolvableMediaPageUrl } from "./media-page-resolver.js";
+import { extractImgurAlbumUrls, extractMediaPageUrls, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
 import { logServiceAlert } from "../alert-log.js";
@@ -402,7 +402,8 @@ async function downloadMedia(rawUrl: string): Promise<DownloadResult[]> {
   const pageUrl = platformUrl;
   if (!pageUrl) throw new Error("Invalid media URL");
   const urls = await resolveMediaPageUrls(pageUrl);
-  const maxItems = ["tiktok.com", "www.tiktok.com"].includes(pageUrl.hostname.toLowerCase()) && pageUrl.pathname.includes("/photo/") ? 35 : telegramMediaGroupMaxItems;
+  const maxItems = (["tiktok.com", "www.tiktok.com"].includes(pageUrl.hostname.toLowerCase()) && pageUrl.pathname.includes("/photo/"))
+    || ["imgur.com", "www.imgur.com"].includes(pageUrl.hostname.toLowerCase()) ? 35 : telegramMediaGroupMaxItems;
   if (urls.length > maxItems) {
     throw new MediaDownloadRejectedError(`Media album has too many items: ${urls.length} > ${maxItems}`);
   }
@@ -495,6 +496,18 @@ async function resolveMediaPageUrls(url: URL): Promise<URL[]> {
     return [directUrl];
   }
   if (!isResolvableMediaPageUrl(url.toString())) return [url];
+  if (["imgur.com", "www.imgur.com"].includes(url.hostname.toLowerCase())) {
+    const albumId = url.pathname.split("/").filter(Boolean)[1]!.split("-").at(-1)!;
+    const apiUrl = new URL(`https://imgur.com/ajaxalbums/getimages/${albumId}/hit.json`);
+    await assertSafeNetworkTarget(apiUrl);
+    const response = await fetch(apiUrl.toString(), { redirect: "manual", headers: { accept: "application/json" } });
+    if (!response.ok) throw new Error(`Imgur album failed with ${response.status}`);
+    const mediaUrls = extractImgurAlbumUrls(await response.json());
+    if (mediaUrls.length === 0) throw new Error("Imgur album images not found");
+    for (const mediaUrl of mediaUrls) await assertSafeNetworkTarget(mediaUrl);
+    console.log(`[resolver] media page=${url.toString()} items=${mediaUrls.length}`);
+    return mediaUrls;
+  }
 
   let pageUrl = url;
   for (let redirects = 0; redirects <= 4; redirects += 1) {

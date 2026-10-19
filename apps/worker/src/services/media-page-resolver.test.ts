@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractMediaPageUrls, extractPostimageDirectImageUrl, isResolvableMediaPageUrl } from "./media-page-resolver.js";
+import { extractImgurAlbumUrls, extractMediaPageUrls, extractPostimageDirectImageUrl, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 
 describe("media page resolver", () => {
   it("extracts Postimages direct image URLs from og:image", () => {
@@ -56,5 +56,16 @@ describe("media page resolver", () => {
     expect(extractMediaPageUrls(html, pageUrl).map(String)).toEqual([
       "https://eblo.id/uploads/x5rEVha/1006(1).opt.mp4",
     ]);
+  });
+
+  it("extracts every original image from an Imgur album in order", () => {
+    const payload = { success: true, data: { count: 2, images: [
+      { hash: "WgpOwku", ext: ".jpg" }, { hash: "8ND0DCy", ext: ".png" },
+    ] } };
+    expect(extractImgurAlbumUrls(payload).map(String)).toEqual([
+      "https://i.imgur.com/WgpOwku.jpg", "https://i.imgur.com/8ND0DCy.png",
+    ]);
+    expect(extractImgurAlbumUrls({ ...payload, data: { ...payload.data, count: 3 } })).toEqual([]);
+    expect(extractImgurAlbumUrls({ success: true, data: { count: 1, images: [{ hash: "../unsafe", ext: ".jpg" }] } })).toEqual([]);
   });
 });
