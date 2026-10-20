@@ -49,6 +49,14 @@ describe("media page resolver", () => {
     ]);
   });
 
+  it("keeps photos and videos in the order of an eblo.id album", () => {
+    const pageUrl = new URL("https://eblo.id/ATTkHNV");
+    const html = '<img class="album-media" src="/uploads/photo.webp"><video class="album-media" src="/uploads/clip.mp4"></video>';
+    expect(extractMediaPageUrls(html, pageUrl).map(String)).toEqual([
+      "https://eblo.id/uploads/photo.webp", "https://eblo.id/uploads/clip.mp4",
+    ]);
+  });
+
   it("extracts an eblo.id video from og:video", () => {
     const pageUrl = new URL("https://eblo.id/x5rEVha");
     const html = '<meta property="og:video" content="/uploads/x5rEVha/1006(1).opt.mp4">';

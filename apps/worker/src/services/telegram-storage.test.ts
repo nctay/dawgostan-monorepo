@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({ sendPhoto: vi.fn(), sendVideo: vi.fn(), sendAnimation: vi.fn(), sendMediaGroup: vi.fn(), copyMessage: vi.fn() }));
@@ -117,8 +121,8 @@ describe("Telegram media spoilers", () => {
 
     const stored = await storeTelegramMediaGroup(
       [
-        { filePath: "/dev/null", mimeType: "image/webp" },
-        { filePath: "/dev/null", mimeType: "image/webp" },
+        { filePath: "/dev/null", mimeType: "image/webp", mediaType: "image" },
+        { filePath: "/dev/null", mimeType: "image/webp", mediaType: "image" },
       ],
       {
         originalUrl: "https://eblo.id/ATTkHNV",
@@ -141,9 +145,40 @@ describe("Telegram media spoilers", () => {
     expect(stored.telegramFileIds).toEqual(["file-1", "file-2"]);
   });
 
+  it("stores a photo and video as one album with their media types", async () => {
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-album-test-"));
+    const videoPath = path.join(tempDir, "clip.mp4");
+    const ffmpeg = spawnSync("ffmpeg", ["-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=1", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", videoPath]);
+    expect(ffmpeg.status).toBe(0);
+    apiMock.sendMediaGroup.mockResolvedValue([
+      { chat: { id: -100 }, message_id: 10, photo: [{ file_id: "photo-1", file_unique_id: "unique-1" }] },
+      { chat: { id: -100 }, message_id: 11, video: { file_id: "video-2", file_unique_id: "unique-2" } },
+    ]);
+    const { storeTelegramMediaGroup } = await import("./telegram-storage.js");
+    try {
+      const stored = await storeTelegramMediaGroup([
+        { filePath: "/dev/null", mimeType: "image/jpeg", mediaType: "image" },
+        { filePath: videoPath, mimeType: "video/mp4", mediaType: "video" },
+      ], {
+        originalUrl: "https://imgur.com/a/example", normalizedUrl: "https://imgur.com/a/example", sha256: "hash",
+        streamerLogin: "streamer", streamerDisplayName: "Streamer", streamStartedAt: new Date("2026-09-07T18:00:00Z"),
+        streamSessionId: "session", assetId: "asset", authorName: "Viewer", messageText: "https://imgur.com/a/example", skipTelegramPublic: false,
+      });
+
+      expect(apiMock.sendMediaGroup.mock.calls[0]?.[1]).toEqual([
+        expect.objectContaining({ type: "photo" }),
+        expect.objectContaining({ type: "video", width: 16, height: 16, duration: 1, supports_streaming: true }),
+      ]);
+      expect(stored.telegramFileIds).toEqual(["photo-1", "video-2"]);
+      expect(stored.telegramMediaTypes).toEqual(["photo", "video"]);
+    } finally {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("stores 18 photos in two Telegram groups", async () => {
     const { storeTelegramMediaGroup } = await import("./telegram-storage.js");
-    const files = Array.from({ length: 18 }, () => ({ filePath: "/dev/null", mimeType: "image/webp" }));
+    const files = Array.from({ length: 18 }, () => ({ filePath: "/dev/null", mimeType: "image/webp", mediaType: "image" as const }));
     let nextId = 1;
     apiMock.sendMediaGroup.mockImplementation(async (_chatId, media: unknown[]) => media.map(() => ({
       chat: { id: -100 }, message_id: nextId++, photo: [{ file_id: `file-${nextId}`, file_unique_id: `unique-${nextId}` }],
@@ -305,6 +340,25 @@ describe("Telegram media spoilers", () => {
     expect(apiMock.copyMessage).not.toHaveBeenCalled();
   });
 
+  it("publishes a mixed album using each stored file type", async () => {
+    apiMock.sendMediaGroup.mockResolvedValue([{ message_id: 20 }, { message_id: 21 }]);
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+    await publishStoredTelegramMedia({
+      id: "asset", visibility: "public", telegramChatId: "-100storage", telegramMessageId: 10,
+      telegramFileId: "photo-1", telegramFileIds: ["photo-1", "video-2"], telegramMediaTypes: ["photo", "video"],
+      telegramIsAnimation: false, publicHasSpoiler: true, mimeType: "image/jpeg", mediaType: "image",
+      publicTelegramChatId: null, publicTelegramMessageId: null,
+    }, {
+      streamerLogin: "streamer", streamStartedAt: new Date("2026-09-07T18:00:00Z"), authorName: "Viewer",
+      messageText: "https://imgur.com/a/example", skipTelegramPublic: false,
+    });
+
+    expect(apiMock.sendMediaGroup.mock.calls[0]?.[1]).toEqual([
+      expect.objectContaining({ type: "photo", media: "photo-1", caption: expect.stringContaining("#streamer_stream"), has_spoiler: true }),
+      expect.objectContaining({ type: "video", media: "video-2", has_spoiler: true }),
+    ]);
+  });
+
   it("publishes all 18 stored photos in two groups", async () => {
     apiMock.sendMediaGroup.mockImplementation(async (_chatId, media: unknown[]) => media.map((_, index) => ({ message_id: 20 + index })));
     const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
@@ -346,6 +400,26 @@ describe("Telegram media spoilers", () => {
     );
 
     expect(apiMock.sendPhoto).toHaveBeenCalledWith("-100public", "file-11", expect.objectContaining({ caption: expect.stringContaining("#streamer_stream") }));
+  });
+
+  it("sends a final single video with the album caption", async () => {
+    apiMock.sendMediaGroup.mockResolvedValue(Array.from({ length: 10 }, (_, index) => ({ message_id: 20 + index })));
+    apiMock.sendVideo.mockResolvedValue({ message_id: 30 });
+    const { publishStoredTelegramMedia } = await import("./telegram-storage.js");
+    await publishStoredTelegramMedia({
+      id: "asset", visibility: "public", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramFileId: "file-1", telegramFileIds: Array.from({ length: 11 }, (_, index) => `file-${index + 1}`),
+      telegramMediaTypes: [...Array(10).fill("photo"), "video"], telegramIsAnimation: false,
+      publicHasSpoiler: false, mimeType: "image/jpeg", mediaType: "image",
+      publicTelegramChatId: null, publicTelegramMessageId: null,
+    }, {
+      streamerLogin: "streamer", streamStartedAt: new Date("2026-09-07T18:00:00Z"), authorName: "Viewer",
+      messageText: "https://imgur.com/a/example", skipTelegramPublic: false,
+    });
+
+    expect(apiMock.sendVideo).toHaveBeenCalledWith("-100public", "file-11", expect.objectContaining({
+      caption: expect.stringContaining("#streamer_stream"), supports_streaming: true,
+    }));
   });
 
   it("keeps Unicode letters in the public sender hashtag", async () => {

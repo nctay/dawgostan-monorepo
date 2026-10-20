@@ -24,9 +24,9 @@ export function extractPostimageDirectImageUrl(html: string, pageUrl: URL): URL 
 
 export function extractMediaPageUrls(html: string, pageUrl: URL): URL[] {
   if (pageUrl.hostname === "eblo.id" || pageUrl.hostname === "www.eblo.id") {
-    const albumUrls = [...html.matchAll(/<img\b[^>]*>/gi)]
+    const albumUrls = [...html.matchAll(/<(?:img|video)\b[^>]*>/gi)]
       .filter((tag) => htmlAttribute(tag[0], "class")?.toLowerCase().split(/\s+/).includes("album-media"))
-      .map((tag) => directMediaUrl(htmlAttribute(tag[0], "src"), pageUrl, "image"))
+      .map((tag) => directMediaUrl(htmlAttribute(tag[0], "src") ?? htmlAttribute(tag[0], "data-src"), pageUrl, /^<video\b/i.test(tag[0]) ? "video" : "image"))
       .filter((url): url is URL => Boolean(url));
     if (albumUrls.length > 0) return uniqueUrls(albumUrls);
 

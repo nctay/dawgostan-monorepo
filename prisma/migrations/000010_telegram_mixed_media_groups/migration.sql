@@ -1,0 +1,2 @@
+ALTER TABLE "assets"
+ADD COLUMN "telegramMediaTypes" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];

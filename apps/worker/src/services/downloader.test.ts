@@ -15,6 +15,7 @@ const classifyNsfwMock = vi.hoisted(() => vi.fn());
 const publishStoredTelegramMediaMock = vi.hoisted(() => vi.fn());
 const storeTelegramMediaMock = vi.hoisted(() => vi.fn());
 const storeTelegramMediaGroupMock = vi.hoisted(() => vi.fn());
+const readVideoMetadataMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../env.js", () => ({
   env: {
@@ -47,6 +48,7 @@ vi.mock("./telegram-storage.js", () => ({
   publishStoredTelegramMedia: publishStoredTelegramMediaMock,
   storeTelegramMedia: storeTelegramMediaMock,
   storeTelegramMediaGroup: storeTelegramMediaGroupMock,
+  readVideoMetadata: readVideoMetadataMock,
   telegramMediaGroupMaxItems: 10,
 }));
 
@@ -394,6 +396,136 @@ describe("media album limits", () => {
         expect.objectContaining({ originalUrl: albumUrl }),
       );
       expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("keeps a supported video beside an Imgur photo", async () => {
+    const albumUrl = "https://imgur.com/a/123-sAUWwPJ";
+    prismaMock.downloadJob.findUnique.mockResolvedValue({ ...(await prismaMock.downloadJob.findUnique()), url: albumUrl });
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-album" });
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 0 });
+    classifyNsfwMock.mockResolvedValue({ publicSpoiler: false, status: "ok" });
+    readVideoMetadataMock.mockResolvedValue({ duration: 10, width: 16, height: 16 });
+    storeTelegramMediaGroupMock.mockResolvedValue({
+      storageProvider: "telegram", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramMessageIds: [1, 2], telegramFileId: "photo", telegramFileIds: ["photo", "video"],
+      telegramMediaTypes: ["photo", "video"], telegramFileUniqueId: "unique",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("ajaxalbums")) return Response.json({ success: true, data: { count: 2, images: [
+        { hash: "WgpOwku", ext: ".jpg" }, { hash: "8ND0DCy", ext: ".mp4" },
+      ] } });
+      return new Response("fixture-media", { headers: { "content-type": url.endsWith(".mp4") ? "video/mp4" : "image/jpeg" } });
+    });
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(storeTelegramMediaGroupMock.mock.calls[0]?.[0].map((item: { mediaType: string }) => item.mediaType)).toEqual(["image", "video"]);
+      expect(prismaMock.asset.upsert).toHaveBeenCalledWith(expect.objectContaining({
+        create: expect.objectContaining({ telegramMediaTypes: ["photo", "video"] }),
+      }));
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("skips an oversized video and still stores the photo", async () => {
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-album" });
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 0 });
+    classifyNsfwMock.mockResolvedValue({ publicSpoiler: false, status: "ok" });
+    storeTelegramMediaMock.mockResolvedValue({
+      storageProvider: "telegram", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramMessageIds: [1], telegramFileId: "photo", telegramFileIds: ["photo"],
+      telegramMediaTypes: ["photo"], telegramFileUniqueId: "unique",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "https://eblo.id/ALBUM01") return new Response(
+        '<img class="album-media" src="https://cdn.example/photo.jpg"><video class="album-media" src="https://cdn.example/clip.mp4"></video>',
+      );
+      if (url.endsWith(".mp4")) return new Response("oversized", { headers: { "content-type": "video/mp4", "content-length": "2000000" } });
+      return new Response("fixture-photo", { headers: { "content-type": "image/jpeg" } });
+    });
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+      expect(storeTelegramMediaGroupMock).not.toHaveBeenCalled();
+      expect(prismaMock.downloadJob.update).not.toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "failed" }) }));
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("skips a video longer than five minutes and still stores the photo", async () => {
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-album" });
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 0 });
+    classifyNsfwMock.mockResolvedValue({ publicSpoiler: false, status: "ok" });
+    readVideoMetadataMock.mockResolvedValue({ duration: 301, width: 16, height: 16 });
+    storeTelegramMediaMock.mockResolvedValue({
+      storageProvider: "telegram", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramMessageIds: [1], telegramFileId: "photo", telegramFileIds: ["photo"],
+      telegramMediaTypes: ["photo"], telegramFileUniqueId: "unique",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "https://eblo.id/ALBUM01") return new Response(
+        '<img class="album-media" src="https://cdn.example/photo.jpg"><video class="album-media" src="https://cdn.example/clip.mp4"></video>',
+      );
+      return new Response("fixture-media", { headers: { "content-type": url.endsWith(".mp4") ? "video/mp4" : "image/jpeg" } });
+    });
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+      expect(storeTelegramMediaGroupMock).not.toHaveBeenCalled();
+      expect(prismaMock.asset.upsert).toHaveBeenCalledWith(expect.objectContaining({
+        create: expect.objectContaining({ telegramMediaTypes: ["photo"] }),
+      }));
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("drops an earlier video if a later photo needs the album byte budget", async () => {
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-album" });
+    prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 0 });
+    classifyNsfwMock.mockResolvedValue({ publicSpoiler: false, status: "ok" });
+    readVideoMetadataMock.mockResolvedValue({ duration: 10, width: 16, height: 16 });
+    storeTelegramMediaMock.mockResolvedValue({
+      storageProvider: "telegram", telegramChatId: "-100storage", telegramMessageId: 1,
+      telegramMessageIds: [1], telegramFileId: "photo", telegramFileIds: ["photo"],
+      telegramMediaTypes: ["photo"], telegramFileUniqueId: "unique",
+    });
+    const payload = new Uint8Array(600_000);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "https://eblo.id/ALBUM01") return new Response(
+        '<video class="album-media" src="https://cdn.example/clip.mp4"></video><img class="album-media" src="https://cdn.example/photo.jpg">',
+      );
+      return new Response(payload, { headers: { "content-type": url.endsWith(".mp4") ? "video/mp4" : "image/jpeg" } });
+    });
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+      expect(storeTelegramMediaMock.mock.calls[0]?.[2]).toBe("image");
+      expect(storeTelegramMediaGroupMock).not.toHaveBeenCalled();
     } finally {
       fetchMock.mockRestore();
     }

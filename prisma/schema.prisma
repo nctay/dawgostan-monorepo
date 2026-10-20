@@ -180,6 +180,7 @@ model Asset {
   telegramMessageIds   Int[]           @default([])
   telegramFileId       String?
   telegramFileIds      String[]        @default([])
+  telegramMediaTypes   String[]        @default([])
   telegramFileUniqueId String?
   publicTelegramChatId String?
   publicTelegramMessageId Int?

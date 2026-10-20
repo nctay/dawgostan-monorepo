@@ -11,7 +11,7 @@ import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegr
 import { prisma } from "../prisma.js";
 import { env } from "../env.js";
 import { assertPlatformMetadataFits, PlatformDownloadRejectedError, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
-import { publishStoredTelegramMedia, storeTelegramMedia, storeTelegramMediaGroup, telegramMediaGroupMaxItems } from "./telegram-storage.js";
+import { publishStoredTelegramMedia, readVideoMetadata, storeTelegramMedia, storeTelegramMediaGroup, telegramMediaGroupMaxItems } from "./telegram-storage.js";
 import { extractImgurAlbumUrls, extractMediaPageUrls, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
@@ -32,7 +32,11 @@ const activeDownloadSlots = new Set<Promise<void>>();
 const youtubeCookiesFile = "/run/private/youtube-cookies.txt";
 const telegramVideoMaxBytes = 49_900_000;
 
-class MediaDownloadRejectedError extends Error {}
+class MediaDownloadRejectedError extends Error {
+  constructor(message: string, readonly mediaType?: "image" | "video") {
+    super(message);
+  }
+}
 
 export async function recoverInterruptedDownloadJobs(): Promise<void> {
   const recovered = await prisma.downloadJob.updateMany({
@@ -155,7 +159,7 @@ async function processOneJob(): Promise<boolean> {
           downloads.length === 1
             ? await storeTelegramMedia(downloaded.filePath, downloaded.mimeType, downloaded.mediaType, storageMetadata)
             : await storeTelegramMediaGroup(
-                downloads.map((item) => ({ filePath: item.filePath, mimeType: item.mimeType })),
+                downloads.map((item) => ({ filePath: item.filePath, mimeType: item.mimeType, mediaType: item.mediaType })),
                 storageMetadata,
               );
 
@@ -173,6 +177,7 @@ async function processOneJob(): Promise<boolean> {
             telegramMessageIds: stored.telegramMessageIds,
             telegramFileId: stored.telegramFileId,
             telegramFileIds: stored.telegramFileIds,
+            telegramMediaTypes: stored.telegramMediaTypes,
             telegramFileUniqueId: stored.telegramFileUniqueId,
             publicTelegramChatId: null,
             publicTelegramMessageId: null,
@@ -193,6 +198,7 @@ async function processOneJob(): Promise<boolean> {
             telegramMessageIds: stored.telegramMessageIds,
             telegramFileId: stored.telegramFileId,
             telegramFileIds: stored.telegramFileIds,
+            telegramMediaTypes: stored.telegramMediaTypes,
             telegramFileUniqueId: stored.telegramFileUniqueId,
             publicHasSpoiler: publicSpoiler,
             telegramIsAnimation: downloads.length === 1 && (Boolean(downloaded.telegramSendAsAnimation) || downloaded.mimeType === "image/gif"),
@@ -412,16 +418,52 @@ async function downloadMedia(rawUrl: string): Promise<DownloadResult[]> {
   const aggregateLimit = Math.min(env.MAX_VIDEO_BYTES, env.MAX_IMAGE_BYTES * telegramMediaGroupMaxItems);
   try {
     for (const url of urls) {
-      const downloaded = await downloadDirectMedia(url);
+      let downloaded: DownloadResult;
+      try {
+        downloaded = await downloadDirectMedia(url);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const videoUrl = mediaTypeFromUrl(url.toString()) === "video" || getExtension(url.pathname) === "gif";
+        const unsuitableVideo = (error instanceof MediaDownloadRejectedError && (error.mediaType === "video" || videoUrl))
+          || (message.startsWith("ffmpeg failed:") && videoUrl);
+        if (urls.length > 1 && unsuitableVideo) {
+          console.info(`[download] skipped album video url=${url.toString()} reason=${message.slice(0, 200)}`);
+          continue;
+        }
+        throw error;
+      }
+      if (urls.length > 1 && downloaded.mediaType === "video") {
+        const { duration, width, height } = await readVideoMetadata(downloaded.filePath, false);
+        const reason = !duration || !width || !height ? "video metadata unavailable" : duration > env.MAX_PLATFORM_VIDEO_SECONDS
+          ? `video is too long: ${duration}s > ${env.MAX_PLATFORM_VIDEO_SECONDS}s` : null;
+        if (reason) {
+          console.info(`[download] skipped album video url=${url.toString()} reason=${reason}`);
+          await fs.promises.rm(downloaded.filePath, { force: true });
+          continue;
+        }
+      }
+      if (urls.length > 1 && totalBytes + downloaded.byteSize > aggregateLimit) {
+        if (downloaded.mediaType === "video") {
+          console.info(`[download] skipped album video url=${url.toString()} reason=album byte limit`);
+          await fs.promises.rm(downloaded.filePath, { force: true });
+          continue;
+        }
+        for (let index = downloads.length - 1; index >= 0 && totalBytes + downloaded.byteSize > aggregateLimit; index--) {
+          if (downloads[index]!.mediaType !== "video") continue;
+          const video = downloads.splice(index, 1)[0]!;
+          totalBytes -= video.byteSize;
+          console.info(`[download] skipped album video url=${video.finalUrl} reason=album byte limit`);
+          await fs.promises.rm(video.filePath, { force: true });
+        }
+      }
+      if (urls.length > 1 && totalBytes + downloaded.byteSize > aggregateLimit) {
+        await fs.promises.rm(downloaded.filePath, { force: true });
+        throw new MediaDownloadRejectedError(`Media album is too large: ${totalBytes + downloaded.byteSize} > ${aggregateLimit}`);
+      }
       downloads.push(downloaded);
-      if (urls.length > 1 && downloaded.mediaType !== "image") {
-        throw new MediaDownloadRejectedError("Media albums may only contain images");
-      }
       totalBytes += downloaded.byteSize;
-      if (urls.length > 1 && totalBytes > aggregateLimit) {
-        throw new MediaDownloadRejectedError(`Media album is too large: ${totalBytes} > ${aggregateLimit}`);
-      }
     }
+    if (downloads.length === 0) throw new MediaDownloadRejectedError("Media album has no suitable items");
     return downloads;
   } catch (error) {
     await Promise.all(downloads.map((item) => fs.promises.rm(item.filePath, { force: true }).catch(() => undefined)));
@@ -450,7 +492,7 @@ async function downloadDirectMedia(initialUrl: URL): Promise<DownloadResult> {
     const contentLength = Number(get.headers.get("content-length") ?? "0");
     if (contentLength > limit) {
       await get.body.cancel();
-      throw new Error(`Media is too large: ${contentLength} > ${limit}`);
+      throw new MediaDownloadRejectedError(`Media is too large: ${contentLength} > ${limit}`, mediaType);
     }
 
     const mimeType = get.headers.get("content-type")?.split(";")[0]?.trim() || "application/octet-stream";
@@ -464,7 +506,7 @@ async function downloadDirectMedia(initialUrl: URL): Promise<DownloadResult> {
     const limiter = new Transform({
       transform(chunk: Buffer, _encoding, callback) {
         byteSize += chunk.length;
-        if (byteSize > limit) callback(new Error(`Media exceeded byte limit ${limit}`));
+        if (byteSize > limit) callback(new MediaDownloadRejectedError(`Media exceeded byte limit ${limit}`, mediaType));
         else {
           hash.update(chunk);
           callback(null, chunk);
@@ -688,10 +730,10 @@ async function finalizeDownload(filePath: string, mediaType: "image" | "video", 
 
     const result = await inspectDownloadedFile(finalPath, finalMediaType);
     if (result.byteSize > limit) {
-      throw new Error(`Media exceeded byte limit after processing: ${result.byteSize} > ${limit}`);
+      throw new MediaDownloadRejectedError(`Media exceeded byte limit after processing: ${result.byteSize} > ${limit}`, finalMediaType);
     }
     if (finalMediaType === "video" && result.byteSize > telegramVideoMaxBytes) {
-      throw new Error(`Telegram video exceeded upload limit after processing: ${result.byteSize} > ${telegramVideoMaxBytes}`);
+      throw new MediaDownloadRejectedError(`Telegram video exceeded upload limit after processing: ${result.byteSize} > ${telegramVideoMaxBytes}`, "video");
     }
 
     return {
