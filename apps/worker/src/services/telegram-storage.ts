@@ -248,6 +248,14 @@ export async function readVideoMetadata(filePath: string, reportFailure = true):
   }
 }
 
+export async function readVideoCodec(filePath: string): Promise<string | undefined> {
+  try {
+    return (await runFfprobe(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", filePath])).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function runFfprobe(args: string[]): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const child = spawn("ffprobe", args, { stdio: ["ignore", "pipe", "pipe"] });

@@ -16,6 +16,7 @@ const publishStoredTelegramMediaMock = vi.hoisted(() => vi.fn());
 const storeTelegramMediaMock = vi.hoisted(() => vi.fn());
 const storeTelegramMediaGroupMock = vi.hoisted(() => vi.fn());
 const readVideoMetadataMock = vi.hoisted(() => vi.fn());
+const readVideoCodecMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../env.js", () => ({
   env: {
@@ -49,6 +50,7 @@ vi.mock("./telegram-storage.js", () => ({
   storeTelegramMedia: storeTelegramMediaMock,
   storeTelegramMediaGroup: storeTelegramMediaGroupMock,
   readVideoMetadata: readVideoMetadataMock,
+  readVideoCodec: readVideoCodecMock,
   telegramMediaGroupMaxItems: 10,
 }));
 
@@ -199,6 +201,7 @@ describe("platform download lifecycle", () => {
       await fs.promises.access(filePath, fs.constants.R_OK);
       return { publicSpoiler: false, status: "ok" };
     });
+    readVideoCodecMock.mockResolvedValue("h264");
     storeTelegramMediaMock.mockResolvedValue({
       storageProvider: "telegram",
       telegramChatId: "-100storage",
@@ -247,6 +250,32 @@ if (args.includes("--dump-json")) {
     } finally {
       process.env.PATH = previousPath;
       await fs.promises.rm(binDir, { force: true, recursive: true });
+    }
+  });
+
+  it("transcodes an HEVC MP4 before storing it in Telegram", async () => {
+    prismaMock.downloadJob.findUnique.mockResolvedValue({
+      ...(await prismaMock.downloadJob.findUnique()),
+      url: "https://cdn.example/clip.mp4",
+    });
+    readVideoCodecMock.mockResolvedValue("hevc");
+    const { transcodeForTelegram } = await import("@dawgostan/media-processing");
+    vi.mocked(transcodeForTelegram).mockImplementation(async (_inputPath, outputPath) => {
+      await fs.promises.writeFile(outputPath, "h264-video");
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("hevc-video", { headers: { "content-type": "video/mp4" } }),
+    );
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(transcodeForTelegram).toHaveBeenCalledOnce();
+      expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+    } finally {
+      fetchMock.mockRestore();
     }
   });
 
@@ -359,6 +388,7 @@ describe("media album limits", () => {
     prismaMock.chatPost.updateMany.mockResolvedValue({ count: 1 });
     prismaMock.asset.updateMany.mockResolvedValue({ count: 1 });
     prismaMock.$transaction.mockResolvedValue([]);
+    readVideoCodecMock.mockResolvedValue("h264");
   });
 
   it("stores both images from an Imgur album as one Telegram album", async () => {

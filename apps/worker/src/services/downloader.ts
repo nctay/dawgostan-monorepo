@@ -11,7 +11,7 @@ import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegr
 import { prisma } from "../prisma.js";
 import { env } from "../env.js";
 import { assertPlatformMetadataFits, PlatformDownloadRejectedError, platformFormatSelector, type PlatformMetadata } from "./platform-download.js";
-import { publishStoredTelegramMedia, readVideoMetadata, storeTelegramMedia, storeTelegramMediaGroup, telegramMediaGroupMaxItems } from "./telegram-storage.js";
+import { publishStoredTelegramMedia, readVideoCodec, readVideoMetadata, storeTelegramMedia, storeTelegramMediaGroup, telegramMediaGroupMaxItems } from "./telegram-storage.js";
 import { extractImgurAlbumUrls, extractMediaPageUrls, isResolvableMediaPageUrl } from "./media-page-resolver.js";
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
@@ -715,7 +715,7 @@ async function finalizeDownload(filePath: string, mediaType: "image" | "video", 
       }
     }
 
-    const needsVideoConversion = finalMediaType === "video" && !alreadyProcessedVideo && !isTelegramMp4(finalPath, finalOriginalMimeType);
+    const needsVideoConversion = finalMediaType === "video" && !alreadyProcessedVideo && !(await isTelegramMp4(finalPath, finalOriginalMimeType));
     const needsVideoCompression = finalMediaType === "video" && (await fs.promises.stat(finalPath)).size > telegramVideoMaxBytes;
     if (finalMediaType === "video" && (needsVideoConversion || needsVideoCompression)) {
       const inputPath = finalPath;
@@ -763,8 +763,9 @@ function isGifMime(mimeType: string | undefined): boolean {
   return mimeType?.split(";")[0]?.trim().toLowerCase() === "image/gif";
 }
 
-function isTelegramMp4(filePath: string, mimeType: string | undefined): boolean {
-  return getExtension(filePath) === "mp4" || mimeType?.split(";")[0]?.trim().toLowerCase() === "video/mp4";
+async function isTelegramMp4(filePath: string, mimeType: string | undefined): Promise<boolean> {
+  if (getExtension(filePath) !== "mp4" && mimeType?.split(";")[0]?.trim().toLowerCase() !== "video/mp4") return false;
+  return (await readVideoCodec(filePath)) === "h264";
 }
 
 async function assertPlatformVideoFits(url: string, limit: number, formatSelector: string): Promise<void> {

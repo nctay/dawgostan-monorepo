@@ -150,6 +150,8 @@ describe("Telegram media spoilers", () => {
     const videoPath = path.join(tempDir, "clip.mp4");
     const ffmpeg = spawnSync("ffmpeg", ["-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=1", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", videoPath]);
     expect(ffmpeg.status).toBe(0);
+    const { readVideoCodec } = await import("./telegram-storage.js");
+    expect(await readVideoCodec(videoPath)).toBe("h264");
     apiMock.sendMediaGroup.mockResolvedValue([
       { chat: { id: -100 }, message_id: 10, photo: [{ file_id: "photo-1", file_unique_id: "unique-1" }] },
       { chat: { id: -100 }, message_id: 11, video: { file_id: "video-2", file_unique_id: "unique-2" } },
