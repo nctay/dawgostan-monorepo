@@ -15,7 +15,7 @@
 
 - Не сохранять медиа offline.
 - После offline держать grace period 30 минут; reconnect продолжает сессию.
-- Игнорировать `!sr`, `catAsk`, `Nightbot`, `StreamElements`.
+- Игнорировать `!sr`, `catAsk`, ответы музыкальной очереди, `Nightbot`, `StreamElements`.
 - Не отправлять повторно сохранённое медиа.
 - `TELEGRAM_PRIVATE_STREAMER_LOGINS` скрывает стримеров из public surfaces; `nctay` остаётся приватным без явного решения.
 - Не удалять PostgreSQL volume и не пересоздавать БД ради troubleshooting.

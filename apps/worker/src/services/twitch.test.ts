@@ -129,6 +129,13 @@ describe("twitch chat command filtering", () => {
     expect(isIgnoredChatCommand("  !SR")).toBe(true);
   });
 
+  it("ignores music queue confirmations", () => {
+    expect(isIgnoredChatCommand("@gelszabolcs @gelszabolcs Added to queue: “Nirvana - The Man Who Sold The World (MTV Unplugged)”. Queue #3 - ~7m 47s.")).toBe(true);
+    expect(isIgnoredChatCommand("@gelszabolcs @gelszabolcs Added to queue: “DJ Melon - Neck Hurts”. Position: now - starts shortly.")).toBe(true);
+    expect(isIgnoredChatCommand("Added to queue: “A song”. https://youtu.be/abc")).toBe(true);
+    expect(isIgnoredChatCommand("Look at this https://youtu.be/abc — someone wrote Added to queue: in the comments")).toBe(false);
+  });
+
   it("does not ignore regular messages that merely mention the command", () => {
     expect(isIgnoredChatCommand("look at this https://example.com/a.jpg !sr")).toBe(false);
     expect(isIgnoredChatCommand("!sra https://example.com/a.jpg")).toBe(false);
