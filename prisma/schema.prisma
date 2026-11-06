@@ -59,6 +59,48 @@ enum StorageProvider {
   s3
 }
 
+enum ConversionStatus {
+  pending
+  downloading
+  storing
+  delivering
+  done
+  failed
+  uncertain
+}
+
+model ConverterUser {
+  username       String              @id
+  telegramUserId BigInt              @unique
+  createdAt      DateTime            @default(now())
+  requests       ConversionRequest[]
+
+  @@map("converter_users")
+}
+
+model ConversionRequest {
+  id                String           @id @default(cuid())
+  ownerId           BigInt
+  telegramUpdateId  Int              @unique
+  chatId            BigInt
+  sourceMessageId   Int
+  originalUrl       String
+  normalizedUrl     String
+  status            ConversionStatus @default(pending)
+  byteSize          BigInt?
+  telegramFileId    String?
+  storageMessageId  Int?
+  telegramMessageId Int?
+  lastError         String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  owner             ConverterUser    @relation(fields: [ownerId], references: [telegramUserId], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@index([ownerId, createdAt])
+  @@map("conversion_requests")
+}
+
 model Streamer {
   id              String               @id @default(cuid())
   twitchUserId    String               @unique
