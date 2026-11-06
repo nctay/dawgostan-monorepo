@@ -642,7 +642,7 @@ async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {
     "--max-filesize",
     String(limit),
     "--match-filter",
-    `duration <= ${env.MAX_PLATFORM_VIDEO_SECONDS}`,
+    `duration <=? ${env.MAX_PLATFORM_VIDEO_SECONDS}`,
     "--format",
     formatSelector,
     "--merge-output-format",
@@ -656,6 +656,9 @@ async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {
     await runYtDlp(ytDlpArgs);
 
     const downloadedPath = await findDownloadedPlatformFile(tempDir);
+    const { duration } = await readVideoMetadata(downloadedPath);
+    if (!duration) throw new MediaDownloadRejectedError("Platform video duration unavailable", "video");
+    assertPlatformMetadataFits({ duration }, limit, env.MAX_PLATFORM_VIDEO_SECONDS);
     const result = await finalizeDownload(downloadedPath, "video", url.toString(), limit);
     const retainedPath = await retainPlatformDownload(result.filePath, tempDir);
     console.log(`[platform] downloaded url=${url.toString()} bytes=${result.byteSize} mime=${result.mimeType}`);

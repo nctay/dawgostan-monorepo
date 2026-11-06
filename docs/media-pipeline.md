@@ -41,7 +41,7 @@ Jobs забираются через `FOR UPDATE SKIP LOCKED`; SHA lock не д�
 
 `yt-dlp`: без playlist, до `MAX_PLATFORM_VIDEO_SECONDS` (default 300), проверка известного размера до скачивания, итоговый MP4. Age-restricted YouTube использует `/run/private/youtube-cookies.txt`.
 
-Instagram Reels используют тот же путь при `ENABLE_PLATFORM_DOWNLOADS=true`. Профили, фото-посты и аудио-страницы не поддерживаются; закрытые и требующие входа ролики могут быть недоступны. Instagram cookies не настроены.
+Instagram Reels используют тот же путь при `ENABLE_PLATFORM_DOWNLOADS=true`. Если платформа не сообщает длительность, скачивание разрешено в пределах byte limit; перед обработкой/публикацией длительность проверяется через `ffprobe`. Слишком длинный файл или файл без определяемой длительности отклоняется. Профили, фото-посты и аудио-страницы не поддерживаются; закрытые и требующие входа ролики могут быть недоступны. Instagram cookies не настроены.
 
 Telegram normalization:
 

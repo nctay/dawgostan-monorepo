@@ -202,6 +202,7 @@ describe("platform download lifecycle", () => {
       return { publicSpoiler: false, status: "ok" };
     });
     readVideoCodecMock.mockResolvedValue("h264");
+    readVideoMetadataMock.mockResolvedValue({ duration: 10 });
     storeTelegramMediaMock.mockResolvedValue({
       storageProvider: "telegram",
       telegramChatId: "-100storage",
@@ -255,6 +256,55 @@ if (args.includes("--dump-json")) {
           update: expect.objectContaining({ sha256s: [expect.any(String)] }),
         }),
       );
+    } finally {
+      process.env.PATH = previousPath;
+      await fs.promises.rm(binDir, { force: true, recursive: true });
+    }
+  });
+
+  it.each([10, 301, undefined])("checks the downloaded Reel when metadata has no duration: %s", async (duration) => {
+    const job = await prismaMock.downloadJob.findUnique();
+    const url = "https://www.instagram.com/reel/FixtureReel/";
+    prismaMock.downloadJob.findUnique.mockResolvedValue({
+      ...job, url, chatPost: { ...job.chatPost, normalizedUrl: url },
+    });
+    readVideoMetadataMock.mockResolvedValue({ duration });
+    const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-test-bin-"));
+    const previousPath = process.env.PATH;
+    await fs.promises.writeFile(path.join(binDir, "yt-dlp"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("--dump-json")) {
+  process.stdout.write(JSON.stringify({ filesize: 13 }));
+} else {
+  // yt-dlp skips unknown durations unless the comparison accepts missing values.
+  if (!args[args.indexOf("--match-filter") + 1].includes("<=?")) process.exit(0);
+  const template = args[args.indexOf("--output") + 1];
+  fs.writeFileSync(template.replace("%(id)s", "fixture").replace("%(ext)s", "mp4"), "fixture-video");
+}
+`, { mode: 0o755 });
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      if (duration === 10) {
+        expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+        expect(publishStoredTelegramMediaMock).toHaveBeenCalledOnce();
+      } else {
+        expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+        expect(publishStoredTelegramMediaMock).not.toHaveBeenCalled();
+        expect(prismaMock.downloadJob.update).toHaveBeenCalledWith({
+          where: { id: "job-1" },
+          data: {
+            status: "failed",
+            lastError: duration ? "Platform video is too long: 301s > 300s" : "Platform video duration unavailable",
+            nextRetryAt: null,
+          },
+        });
+      }
     } finally {
       process.env.PATH = previousPath;
       await fs.promises.rm(binDir, { force: true, recursive: true });
