@@ -43,7 +43,10 @@ describe("conversion request queue", () => {
       originalUrl: "https://cdn.example/video.mp4", normalizedUrl: "https://cdn.example/video.mp4",
       owner: { username: "alice", telegramUserId: 1n },
     });
-    db.conversionRequest.update.mockResolvedValue({});
+    db.conversionRequest.update.mockImplementation(async ({ data }: { data: { status: string } }) => {
+      if (data.status === "pending") claimed = false;
+      return {};
+    });
     db.conversionRequest.findFirst.mockResolvedValue(null);
     db.conversionRequest.aggregate.mockResolvedValue({ _sum: { byteSize: 0n } });
     db.asset.aggregate.mockResolvedValue({ _sum: { byteSize: 0n } });
@@ -106,11 +109,37 @@ describe("conversion request queue", () => {
     db.conversionRequest.findUnique.mockRejectedValueOnce(new Error("temporary database error"));
     processDownloadQueue();
     await waitForDownloadQueue();
-    expect(db.conversionRequest.updateMany).toHaveBeenCalledWith({ where: { id: "request-1", status: "downloading" }, data: { status: "pending" } });
-    db.$queryRaw.mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: "request-1" }]);
+    expect(db.conversionRequest.update).toHaveBeenCalledWith({ where: { id: "request-1" }, data: { status: "pending" } });
     processDownloadQueue();
     await waitForDownloadQueue();
     expect(telegram.sendVideo).toHaveBeenCalledWith("1", "converter-file", expect.anything());
+  });
+
+  it("retains recovery after both the claimed-row read and the requeue write fail", async () => {
+    db.conversionRequest.findUnique.mockRejectedValueOnce(new Error("database unavailable"));
+    db.conversionRequest.update.mockRejectedValueOnce(new Error("database unavailable"));
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(telegram.sendVideo).toHaveBeenCalledWith("1", "converter-file", expect.anything());
+  });
+
+  it("persists an unknown delivery after the database returns without resending video", async () => {
+    let unavailable = true;
+    db.conversionRequest.update.mockImplementation(async ({ data }: { data: { status: string } }) => {
+      if (unavailable && (data.status === "done" || data.status === "uncertain")) throw new Error("database unavailable");
+      return {};
+    });
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(telegram.sendVideo).toHaveBeenCalledTimes(2);
+    unavailable = false;
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(telegram.sendVideo).toHaveBeenCalledTimes(2);
+    expect(telegram.sendMessage).toHaveBeenCalledWith("1", expect.stringContaining("Результат отправки неизвестен"));
+    expect(db.conversionRequest.update).toHaveBeenCalledWith({ where: { id: "request-1" }, data: expect.objectContaining({ status: "uncertain" }) });
   });
 
   it("does not use the archive's YouTube cookies or yt-dlp user configuration", async () => {

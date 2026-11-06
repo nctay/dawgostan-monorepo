@@ -38,6 +38,8 @@ const converterBotKey = env.TELEGRAM_CONVERTER_BOT_TOKEN ? crypto.createHash("sh
 const converterSendLimiter = new SerialRateLimiter(1100);
 const converterUsernames = new Set((env.TELEGRAM_CONVERTER_ALLOWED_USERNAMES ?? "").split(",").map((name) => name.trim().replace(/^@/, "").toLowerCase()).filter(Boolean));
 const converterUncertainMessage = "Результат отправки неизвестен. Проверь сообщения: автоматически повторять отправку не буду.";
+const converterRecovery = new Map<string, { status: "pending" | "failed" | "uncertain"; lastError?: string; chatId?: string }>();
+let converterRecoveryTask: Promise<void> | null = null;
 
 class MediaDownloadRejectedError extends Error {
   constructor(message: string, readonly mediaType?: "image" | "video") {
@@ -926,6 +928,7 @@ async function assertDailyLimitAvailable(): Promise<void> {
 
 async function processOneConversionRequest(): Promise<boolean> {
   if (!converterBot || !env.TELEGRAM_STORAGE_CHAT_ID) return false;
+  await flushConverterRecovery();
   const claimed = await prisma.$queryRaw<Array<{ id: string }>>`
     UPDATE "conversion_requests" SET "status" = 'downloading', "updatedAt" = NOW()
     WHERE "id" = (
@@ -935,13 +938,15 @@ async function processOneConversionRequest(): Promise<boolean> {
   `;
   if (!claimed[0]) return false;
   const request = await prisma.conversionRequest.findUnique({ where: { id: claimed[0].id }, include: { owner: true } }).catch(async () => {
-    await prisma.conversionRequest.updateMany({ where: { id: claimed[0]!.id, status: "downloading" }, data: { status: "pending" } });
+    converterRecovery.set(claimed[0]!.id, { status: "pending" });
+    await flushConverterRecovery();
     return undefined;
   });
   if (request === undefined) return false;
   if (!request) return true;
   if (!converterUsernames.has(request.owner.username) || request.chatId !== request.ownerId) {
-    await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "failed", lastError: "Access revoked" } });
+    converterRecovery.set(request.id, { status: "failed", lastError: "Access revoked" });
+    await flushConverterRecovery();
     return true;
   }
   let downloads: DownloadResult[] = [];
@@ -987,14 +992,30 @@ async function processOneConversionRequest(): Promise<boolean> {
     const reason = uncertain ? converterUncertainMessage
       : phase !== "downloading" ? "Telegram отклонил отправку видео. Проверь права бота в приватном хранилище."
       : error instanceof MediaDownloadRejectedError ? error.message : "Не удалось скачать видео. Проверь, что ссылка публичная и ролик не длиннее 5 минут.";
-    await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: uncertain ? "uncertain" : "failed", lastError: reason } });
-    await converterSendLimiter.schedule(() => converterBot.api.sendMessage(String(request.chatId), reason)).catch(() => {
-      logServiceAlert({ code: "converter_notification_failed", title: "Не удалось уведомить о конвертации", component: "converter", error: new Error("Converter notification failed"), details: { request_id: request.id } });
-    });
+    converterRecovery.set(request.id, { status: uncertain ? "uncertain" : "failed", lastError: reason, chatId: String(request.chatId) });
+    await flushConverterRecovery();
   } finally {
     await Promise.all(downloads.map((item) => fs.promises.rm(item.filePath, { force: true }).catch(() => undefined)));
   }
   return true;
+}
+
+function flushConverterRecovery(): Promise<void> {
+  if (converterRecoveryTask) return converterRecoveryTask;
+  // Serialize recovery across slots; failed writes stay queued until the database returns.
+  converterRecoveryTask = (async () => {
+    for (const [id, recovery] of converterRecovery) {
+      const { chatId, ...data } = recovery;
+      await prisma.conversionRequest.update({ where: { id }, data });
+      converterRecovery.delete(id);
+      if (chatId && recovery.lastError && converterBot) {
+        await converterSendLimiter.schedule(() => converterBot.api.sendMessage(chatId, recovery.lastError!)).catch(() => {
+          logServiceAlert({ code: "converter_notification_failed", title: "Не удалось уведомить о конвертации", component: "converter", error: new Error("Converter notification failed"), details: { request_id: id } });
+        });
+      }
+    }
+  })().finally(() => { converterRecoveryTask = null; });
+  return converterRecoveryTask;
 }
 
 async function markBlocked(jobId: string, chatPostId: string, reason: string): Promise<void> {
