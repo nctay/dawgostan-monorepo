@@ -209,7 +209,7 @@ describe("twitch media ingestion", () => {
     envMock.ALLOW_PRIVATE_MEDIA_HOSTS = false;
   });
 
-  it("stores the public Telegram skip flag with the media post", async () => {
+  it.each(["https://youtu.be/abc123", "https://www.instagram.com/reel/Chunk8-jurw/?igsh=shared"])("queues media with its public Telegram skip flag: %s", async (url) => {
     const { ingestChatMessage } = await import("./twitch.js");
     prismaMock.streamer.findUnique.mockResolvedValue({
       id: "streamer-1",
@@ -228,12 +228,15 @@ describe("twitch media ingestion", () => {
       streamerLogin: "streamer",
       twitchMessageId: "message-1",
       authorName: "Viewer",
-      messageText: "!skip_tghttps://youtu.be/abc123",
+      messageText: `!skip_tg${url}`,
       postedAt: new Date("2026-06-12T10:04:00Z"),
     });
 
     expect(prismaMock.chatPost.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ skipTelegramPublic: true }) }),
+    );
+    expect(prismaMock.downloadJob.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ url }) }),
     );
   });
 

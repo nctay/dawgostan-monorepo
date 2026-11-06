@@ -212,7 +212,13 @@ describe("platform download lifecycle", () => {
     publishStoredTelegramMediaMock.mockResolvedValue(undefined);
   });
 
-  it("keeps a compatible platform video readable until storage completes", async () => {
+  it.each(["https://clips.twitch.tv/FixtureClip", "https://www.instagram.com/reel/FixtureReel/"])("stores and publishes a compatible platform video: %s", async (url) => {
+    const job = await prismaMock.downloadJob.findUnique();
+    prismaMock.downloadJob.findUnique.mockResolvedValue({
+      ...job,
+      url,
+      chatPost: { ...job.chatPost, normalizedUrl: url, messageText: url },
+    });
     const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-test-bin-"));
     const ytDlpPath = path.join(binDir, "yt-dlp");
     const previousPath = process.env.PATH;
@@ -241,6 +247,8 @@ if (args.includes("--dump-json")) {
       await waitForDownloadQueue();
 
       expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
+      expect(storeTelegramMediaMock).toHaveBeenCalledWith(expect.any(String), "video/mp4", "video", expect.objectContaining({ originalUrl: url }));
+      expect(publishStoredTelegramMediaMock).toHaveBeenCalledOnce();
       expect(prismaMock.asset.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
           create: expect.objectContaining({ sha256s: [expect.any(String)] }),

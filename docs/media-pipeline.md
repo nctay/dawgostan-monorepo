@@ -21,11 +21,11 @@ Twitch status берётся из Helix, w.tv — из profile/channel API. Offl
 
 - jpg/jpeg/png/gif/webp/avif, mp4/webm/mov;
 - Discord CDN без расширения;
-- Twitch Clips, TikTok, YouTube watch/Shorts/youtu.be;
+- Twitch Clips, TikTok, YouTube watch/Shorts/youtu.be, публичные Instagram Reels (`instagram.com/reel/...` и `/reels/...`);
 - Postimages, ImgBB, eblo.id, Yandex Disk `/i/...` и `/d/...`;
 - `clck.su`, `clck.ru`, `bit.ly`, `tinyurl.com` с поддерживаемым target.
 
-Нормализация убирает fragment/default port, приводит hostname к lower-case, канонизирует Twitch Clips/Yandex Disk, чистит Discord query params.
+Нормализация убирает fragment/default port, приводит hostname к lower-case, канонизирует Twitch Clips/Yandex Disk/Instagram Reels, чистит Discord query params. Варианты Reels с `www`, без завершающего slash и с tracking query приводятся к `https://www.instagram.com/reel/<id>/`, чтобы не сохранять ролик повторно.
 
 Все redirects и DNS addresses проходят SSRF-защиту: только HTTP(S), без localhost/private/local/reserved IP. `ALLOW_PRIVATE_MEDIA_HOSTS=true` отключает DNS-проверку; в production не использовать без причины.
 
@@ -40,6 +40,8 @@ Jobs забираются через `FOR UPDATE SKIP LOCKED`; SHA lock не д�
 Прямое медиа: HEAD, затем streaming GET с byte counter. Defaults: 30 MiB image, 100 MiB video.
 
 `yt-dlp`: без playlist, до `MAX_PLATFORM_VIDEO_SECONDS` (default 300), проверка известного размера до скачивания, итоговый MP4. Age-restricted YouTube использует `/run/private/youtube-cookies.txt`.
+
+Instagram Reels используют тот же путь при `ENABLE_PLATFORM_DOWNLOADS=true`. Профили, фото-посты и аудио-страницы не поддерживаются; закрытые и требующие входа ролики могут быть недоступны. Instagram cookies не настроены.
 
 Telegram normalization:
 

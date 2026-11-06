@@ -39,6 +39,26 @@ describe("media helpers", () => {
     expect(isSupportedMediaUrl("https://eblo.id/@hokusmodertwitcha")).toBe(false);
   });
 
+  it("routes Instagram Reels to the platform downloader and deduplicates shared links", () => {
+    const canonical = "https://www.instagram.com/reel/Chunk8-jurw/";
+    for (const url of [canonical, "https://instagram.com/reel/Chunk8-jurw",
+      `${canonical}?igsh=shared&utm_source=chat#video`, "www.instagram.com/reel/Chunk8-jurw/",
+      "https://www.instagram.com/reels/Chunk8-jurw/?igsh=shared"]) {
+      expect(isSupportedMediaUrl(url)).toBe(true);
+      expect(isPlatformMediaUrl(url)).toBe(true);
+      expect(normalizeUrl(url)).toBe(canonical);
+    }
+    expect(normalizeUrl("https://instagram.com/reel/AbC_123-/")).toBe("https://www.instagram.com/reel/AbC_123-/");
+    for (const url of ["https://www.instagram.com/example/", "https://www.instagram.com/reel/",
+      "https://www.instagram.com/reels/audio/123/", "https://www.instagram.com/p/Chunk8-jurw/",
+      "https://www.instagram.com/reel/Chunk8-jurw/extra/", "https://www.instagram.com/reel/invalid.id/",
+      "https://instagram.com.evil.com/reel/Chunk8-jurw/", "https://instagram.com@evil.com/reel/Chunk8-jurw/"]) {
+      expect(isSupportedMediaUrl(url)).toBe(false);
+      expect(isPlatformMediaUrl(url)).toBe(false);
+      expect(normalizeUrl(url)).toBe(url);
+    }
+  });
+
   it("accepts Imgur albums but not unrelated Imgur pages", () => {
     expect(isSupportedMediaUrl("https://imgur.com/a/123-sAUWwPJ")).toBe(true);
     expect(isSupportedMediaUrl("https://imgur.com/a/sAUWwPJ")).toBe(true);

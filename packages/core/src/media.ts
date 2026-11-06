@@ -8,7 +8,7 @@ export const ALLOWED_MEDIA_HOSTS = new Set([
   "images-ext-1.discordapp.net",
   "i.ibb.co",
 ]);
-export const PLATFORM_MEDIA_HOSTS = new Set(["www.tiktok.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be"]);
+export const PLATFORM_MEDIA_HOSTS = new Set(["www.tiktok.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be", "www.instagram.com", "instagram.com"]);
 export const MEDIA_PAGE_HOSTS = new Set(["postimg.cc", "www.postimg.cc", "ibb.co", "www.ibb.co", "eblo.id", "www.eblo.id", "imgur.com", "www.imgur.com", "disk.yandex.ru", "yadi.sk"]);
 
 export const DEFAULT_MAX_IMAGE_BYTES = 30 * 1024 * 1024;
@@ -44,6 +44,8 @@ export function normalizeUrl(rawUrl: string): string | null {
 
   const twitchClipId = getTwitchClipId(url);
   if (twitchClipId) return `https://clips.twitch.tv/${twitchClipId}`;
+  const instagramReelId = getInstagramReelId(url);
+  if (instagramReelId) return `https://www.instagram.com/reel/${instagramReelId}/`;
   if (isYandexDiskUrl(url.toString())) return `https://disk.yandex.ru${url.pathname.replace(/\/$/, "")}`;
 
   if ((url.protocol === "https:" && url.port === "443") || (url.protocol === "http:" && url.port === "80")) {
@@ -111,7 +113,12 @@ export function isPlatformMediaUrl(rawUrl: string): boolean {
   if (hostname.endsWith("youtube.com")) return url.pathname.startsWith("/shorts/") || (url.pathname === "/watch" && Boolean(url.searchParams.get("v")));
   if (["vm.tiktok.com", "vt.tiktok.com"].includes(hostname)) return url.pathname.length > 1;
   if (["tiktok.com", "www.tiktok.com"].includes(hostname)) return /^\/(?:@[^/]+\/(?:video|photo)\/\d+|t\/[^/]+)\/?$/.test(url.pathname);
-  return false;
+  return Boolean(getInstagramReelId(url));
+}
+
+function getInstagramReelId(url: URL): string | null {
+  if (!["instagram.com", "www.instagram.com"].includes(url.hostname)) return null;
+  return url.pathname.match(/^\/reels?\/([A-Za-z0-9_-]+)\/?$/)?.[1] ?? null;
 }
 
 function getTwitchClipId(url: URL): string | null {
