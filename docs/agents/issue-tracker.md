@@ -7,4 +7,3 @@ Specs and implementation tickets live in GitHub Issues for nctay/dawgostan-monor
 - Add native blocked-by relationships using the blocking issue's numeric database ID. If the API is unavailable, record blocking issue links in the body and report the fallback.
 - Work only on tickets whose blockers are complete.
 - PRs as a request surface: no.
-

@@ -88,6 +88,8 @@ model ConversionRequest {
   normalizedUrl     String
   status            ConversionStatus @default(pending)
   byteSize          BigInt?
+  sha256            String?
+  botKey            String?
   telegramFileId    String?
   storageMessageId  Int?
   telegramMessageId Int?
@@ -98,6 +100,7 @@ model ConversionRequest {
 
   @@index([status, createdAt])
   @@index([ownerId, createdAt])
+  @@index([botKey, sha256])
   @@map("conversion_requests")
 }
 

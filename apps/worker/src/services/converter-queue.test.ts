@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GrammyError } from "grammy";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const env = vi.hoisted(() => ({
   TELEGRAM_CONVERTER_BOT_TOKEN: "123456:converter-token", TELEGRAM_CONVERTER_ALLOWED_USERNAMES: "@Alice,bob", TELEGRAM_STORAGE_CHAT_ID: "-100storage",
@@ -10,7 +13,7 @@ const db = vi.hoisted(() => ({
   $queryRaw: vi.fn(),
   asset: { aggregate: vi.fn() },
   downloadJob: { updateMany: vi.fn() },
-  conversionRequest: { findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn(), findMany: vi.fn(), aggregate: vi.fn() },
+  conversionRequest: { findUnique: vi.fn(), findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn(), findMany: vi.fn(), aggregate: vi.fn() },
   converterUser: { findUnique: vi.fn() },
 }));
 const telegram = vi.hoisted(() => ({ sendVideo: vi.fn(), sendMessage: vi.fn() }));
@@ -41,6 +44,7 @@ describe("conversion request queue", () => {
       owner: { username: "alice", telegramUserId: 1n },
     });
     db.conversionRequest.update.mockResolvedValue({});
+    db.conversionRequest.findFirst.mockResolvedValue(null);
     db.conversionRequest.aggregate.mockResolvedValue({ _sum: { byteSize: 0n } });
     db.asset.aggregate.mockResolvedValue({ _sum: { byteSize: 0n } });
     probe.mockResolvedValue({ width: 720, height: 1280, duration: 12 });
@@ -88,5 +92,52 @@ describe("conversion request queue", () => {
     await waitForDownloadQueue();
     expect(db.conversionRequest.update).toHaveBeenCalledWith({ where: { id: "request-1" }, data: expect.objectContaining({ status: "failed" }) });
     expect(telegram.sendMessage).toHaveBeenCalledWith("1", expect.stringContaining("Telegram отклонил"));
+  });
+
+  it("reuses the converter's stored video without posting another storage message", async () => {
+    db.conversionRequest.findFirst.mockResolvedValue({ telegramFileId: "stored-converter-file", storageMessageId: 55 });
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(telegram.sendVideo).toHaveBeenCalledOnce();
+    expect(telegram.sendVideo).toHaveBeenCalledWith("1", "stored-converter-file", expect.anything());
+  });
+
+  it("requeues safely after a transient read error following the SQL claim", async () => {
+    db.conversionRequest.findUnique.mockRejectedValueOnce(new Error("temporary database error"));
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(db.conversionRequest.updateMany).toHaveBeenCalledWith({ where: { id: "request-1", status: "downloading" }, data: { status: "pending" } });
+    db.$queryRaw.mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: "request-1" }]);
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(telegram.sendVideo).toHaveBeenCalledWith("1", "converter-file", expect.anything());
+  });
+
+  it("does not use the archive's YouTube cookies or yt-dlp user configuration", async () => {
+    db.conversionRequest.findUnique.mockResolvedValue({ ...(await db.conversionRequest.findUnique()), originalUrl: "https://youtu.be/Fixture" });
+    const originalExists = fs.existsSync;
+    const exists = vi.spyOn(fs, "existsSync").mockImplementation((file) => String(file) === "/run/private/youtube-cookies.txt" || originalExists(file));
+    const binDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "converter-test-bin-"));
+    const previousPath = process.env.PATH;
+    await fs.promises.writeFile(path.join(binDir, "yt-dlp"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("--cookies") || !args.includes("--ignore-config")) process.exit(1);
+if (args.includes("--dump-json")) process.stdout.write(JSON.stringify({ duration: 12, filesize: 13 }));
+else {
+  const template = args[args.indexOf("--output") + 1];
+  fs.writeFileSync(template.replace("%(id)s", "fixture").replace("%(ext)s", "mp4"), "fixture-video");
+}
+`, { mode: 0o755 });
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+    try {
+      processDownloadQueue();
+      await waitForDownloadQueue();
+      expect(telegram.sendVideo).toHaveBeenCalledWith("1", "converter-file", expect.anything());
+    } finally {
+      exists.mockRestore();
+      process.env.PATH = previousPath;
+      await fs.promises.rm(binDir, { recursive: true, force: true });
+    }
   });
 });

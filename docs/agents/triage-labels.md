@@ -7,4 +7,3 @@
 | Ready for an agent | ready-for-agent |
 | Requires a human | ready-for-human |
 | Will not be implemented | wontfix |
-

@@ -21,6 +21,8 @@ CREATE TABLE "conversion_requests" (
     "normalizedUrl" TEXT NOT NULL,
     "status" "ConversionStatus" NOT NULL DEFAULT 'pending',
     "byteSize" BIGINT,
+    "sha256" TEXT,
+    "botKey" TEXT,
     "telegramFileId" TEXT,
     "storageMessageId" INTEGER,
     "telegramMessageId" INTEGER,
@@ -43,6 +45,7 @@ CREATE INDEX "conversion_requests_status_createdAt_idx" ON "conversion_requests"
 -- CreateIndex
 CREATE INDEX "conversion_requests_ownerId_createdAt_idx" ON "conversion_requests"("ownerId", "createdAt");
 
+CREATE INDEX "conversion_requests_botKey_sha256_idx" ON "conversion_requests"("botKey", "sha256");
+
 -- AddForeignKey
 ALTER TABLE "conversion_requests" ADD CONSTRAINT "conversion_requests_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "converter_users"("telegramUserId") ON DELETE RESTRICT ON UPDATE CASCADE;
-
