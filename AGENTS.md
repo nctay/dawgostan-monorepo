@@ -147,3 +147,17 @@ If worker tests fail resolving a workspace package, build dependencies first:
 ```bash
 pnpm turbo run build --filter=worker...
 ```
+
+## Agent skills
+
+### Issue tracker
+
+Use GitHub Issues for specs and tickets; see docs/agents/issue-tracker.md before planning or publishing work.
+
+### Triage labels
+
+Use the five standard triage labels; see docs/agents/triage-labels.md before assigning a ticket status.
+
+### Domain docs
+
+Use the root CONTEXT.md and relevant docs/adr/ decisions; see docs/agents/domain.md when exploring or documenting a feature.

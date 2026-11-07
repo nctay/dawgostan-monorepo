@@ -33,6 +33,9 @@ importers:
 
   apps/bot:
     dependencies:
+      '@dawgostan/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@prisma/client':
         specifier: ^6.10.1
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)

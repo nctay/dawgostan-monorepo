@@ -41,6 +41,7 @@ jobs:
       GHCR_USERNAME: ${{ github.actor }}
       GHCR_TOKEN: ${{ github.token }}
       PROD_ENV_B64: ${{ secrets.PROD_ENV_B64 }}
+      TELEGRAM_CONVERTER_ENV_B64: ${{ secrets.TELEGRAM_CONVERTER_ENV_B64 }}
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
       GRAFANA_CLOUD_TOKEN: ${{ secrets.GRAFANA_CLOUD_TOKEN }}
       GRAFANA_CLOUD_PROMETHEUS_URL: ${{ vars.GRAFANA_CLOUD_PROMETHEUS_URL }}
@@ -117,7 +118,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: APP_DIR,PROD_ENV_B64,YOUTUBE_COOKIES_B64,BOT_IMAGE,WORKER_IMAGE,NSFW_ENSEMBLE_IMAGE,GHCR_USERNAME,GHCR_TOKEN,GRAFANA_CLOUD_TOKEN,GRAFANA_CLOUD_PROMETHEUS_URL,GRAFANA_CLOUD_PROMETHEUS_USER,GRAFANA_CLOUD_LOKI_URL,GRAFANA_CLOUD_LOKI_USER
+          envs: APP_DIR,PROD_ENV_B64,TELEGRAM_CONVERTER_ENV_B64,YOUTUBE_COOKIES_B64,BOT_IMAGE,WORKER_IMAGE,NSFW_ENSEMBLE_IMAGE,GHCR_USERNAME,GHCR_TOKEN,GRAFANA_CLOUD_TOKEN,GRAFANA_CLOUD_PROMETHEUS_URL,GRAFANA_CLOUD_PROMETHEUS_USER,GRAFANA_CLOUD_LOKI_URL,GRAFANA_CLOUD_LOKI_USER
           script: |
             set -eu
             cd "$APP_DIR"
@@ -137,6 +138,10 @@ jobs:
             test -s private/grafana-cloud-token.tmp
             mv private/grafana-cloud-token.tmp private/grafana-cloud-token
             printf '%s' "$PROD_ENV_B64" | base64 -d > .env
+            if [ -n "$TELEGRAM_CONVERTER_ENV_B64" ]; then
+              printf '\n' >> .env
+              printf '%s' "$TELEGRAM_CONVERTER_ENV_B64" | base64 -d >> .env
+            fi
             {
               printf 'BOT_IMAGE=%s\n' "$BOT_IMAGE"
               printf 'WORKER_IMAGE=%s\n' "$WORKER_IMAGE"

@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
+import { Bot, GrammyError, InputFile } from "grammy";
 import { assertSafeResolvedAddress, assertSafeUrl, getExtension, isAnimatedWebp, isPlatformMediaUrl, isYandexDiskUrl, maxBytesForMediaType, mediaTypeFromContentType, mediaTypeFromUrl, normalizeUrl, toUrl } from "@dawgostan/core";
 import { convertAnimatedWebpToMp4, normalizePhotoForTelegram, transcodeForTelegram } from "@dawgostan/media-processing";
 import { prisma } from "../prisma.js";
@@ -16,6 +17,8 @@ import { extractImgurAlbumUrls, extractMediaPageUrls, isResolvableMediaPageUrl }
 import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
 import { logServiceAlert } from "../alert-log.js";
+import { SerialRateLimiter } from "./rate-limit.js";
+import { replaceChannelPost, sendConverterMedia, type ConverterMedia } from "./converter-channel.js";
 
 type DownloadResult = {
   filePath: string;
@@ -31,6 +34,13 @@ const shaLocks = new Map<string, Promise<void>>();
 const activeDownloadSlots = new Set<Promise<void>>();
 const youtubeCookiesFile = "/run/private/youtube-cookies.txt";
 const telegramVideoMaxBytes = 49_900_000;
+const converterBot = env.TELEGRAM_CONVERTER_BOT_TOKEN ? new Bot(env.TELEGRAM_CONVERTER_BOT_TOKEN) : null;
+const converterBotKey = env.TELEGRAM_CONVERTER_BOT_TOKEN ? crypto.createHash("sha256").update(env.TELEGRAM_CONVERTER_BOT_TOKEN).digest("hex") : null;
+const converterSendLimiter = new SerialRateLimiter(1100);
+const converterUsernames = new Set((env.TELEGRAM_CONVERTER_ALLOWED_USERNAMES ?? "").split(",").map((name) => name.trim().replace(/^@/, "").toLowerCase()).filter(Boolean));
+const converterUncertainMessage = "Результат отправки неизвестен. Проверь сообщения: автоматически повторять отправку не буду.";
+const converterRecovery = new Map<string, { status: "pending" | "failed" | "uncertain"; lastError?: string; chatId?: string }>();
+let converterRecoveryTask: Promise<void> | null = null;
 
 class MediaDownloadRejectedError extends Error {
   constructor(message: string, readonly mediaType?: "image" | "video") {
@@ -59,12 +69,28 @@ export async function recoverInterruptedDownloadJobs(): Promise<void> {
     data: { status: "pending", nextRetryAt: null },
   });
   if (recovered.count) console.log(`[download] recovered interrupted jobs=${recovered.count}`);
+  if (converterBot) {
+    await prisma.conversionRequest.updateMany({ where: { status: "downloading" }, data: { status: "pending" } });
+    const interrupted = await prisma.conversionRequest.findMany({ where: { status: { in: ["storing", "delivering"] } }, include: { owner: true } });
+    for (const request of interrupted) {
+      await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "uncertain", lastError: converterUncertainMessage } });
+      if (request.owner && converterUsernames.has(request.owner.username)) {
+        await converterSendLimiter.schedule(() => converterBot.api.sendMessage(String(request.chatId), converterUncertainMessage)).catch(() => undefined);
+      }
+    }
+  }
 }
 
 export function processDownloadQueue(): void {
   const slots = Math.max(1, env.MAX_PARALLEL_DOWNLOADS);
   while (activeDownloadSlots.size < slots) {
-    const task = (async () => { while (await processOneJob()) {} })();
+    const task = (async () => {
+      while (true) {
+        const archived = await processOneJob();
+        const converted = await processOneConversionRequest();
+        if (!archived && !converted) break;
+      }
+    })();
     activeDownloadSlots.add(task);
     void task
       .catch((error) =>
@@ -397,13 +423,13 @@ async function withShaLock<T>(sha256: string, task: () => Promise<T>): Promise<T
   }
 }
 
-async function downloadMedia(rawUrl: string): Promise<DownloadResult[]> {
+async function downloadMedia(rawUrl: string, allowYouTubeCookies = true): Promise<DownloadResult[]> {
   let platformUrl = toUrl(rawUrl);
   if (platformUrl && ["vm.tiktok.com", "vt.tiktok.com"].includes(platformUrl.hostname.toLowerCase())) {
     platformUrl = await resolveTikTokShortUrl(platformUrl);
   }
   if (platformUrl && isPlatformMediaUrl(platformUrl.toString()) && !/^\/@[^/]+\/photo\/\d+\/?$/.test(platformUrl.pathname)) {
-    return [await downloadPlatformVideo(platformUrl.toString())];
+    return [await downloadPlatformVideo(platformUrl.toString(), allowYouTubeCookies)];
   }
   const pageUrl = platformUrl;
   if (!pageUrl) throw new Error("Invalid media URL");
@@ -620,7 +646,7 @@ async function extractTikTokPhotoUrls(url: URL): Promise<URL[]> {
   }
 }
 
-async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {
+async function downloadPlatformVideo(rawUrl: string, allowYouTubeCookies: boolean): Promise<DownloadResult> {
   if (!env.ENABLE_PLATFORM_DOWNLOADS) throw new Error("Platform downloads are disabled");
 
   const url = toUrl(rawUrl);
@@ -630,7 +656,7 @@ async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {
   const limit = env.MAX_VIDEO_BYTES;
   const formatSelector = platformFormatSelector(limit);
   console.log(`[platform] metadata url=${url.toString()}`);
-  await assertPlatformVideoFits(url.toString(), limit, formatSelector);
+  await assertPlatformVideoFits(url.toString(), limit, formatSelector, allowYouTubeCookies);
   console.log(`[platform] downloading url=${url.toString()}`);
 
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "archive-platform-"));
@@ -653,7 +679,7 @@ async function downloadPlatformVideo(rawUrl: string): Promise<DownloadResult> {
   ];
 
   try {
-    await runYtDlp(ytDlpArgs);
+    await runYtDlp(ytDlpArgs, allowYouTubeCookies);
 
     const downloadedPath = await findDownloadedPlatformFile(tempDir);
     const { duration } = await readVideoMetadata(downloadedPath);
@@ -771,7 +797,7 @@ async function isTelegramMp4(filePath: string, mimeType: string | undefined): Pr
   return (await readVideoCodec(filePath)) === "h264";
 }
 
-async function assertPlatformVideoFits(url: string, limit: number, formatSelector: string): Promise<void> {
+async function assertPlatformVideoFits(url: string, limit: number, formatSelector: string, allowYouTubeCookies: boolean): Promise<void> {
   const metadata = JSON.parse(
     await runYtDlp([
       "--dump-json",
@@ -782,16 +808,17 @@ async function assertPlatformVideoFits(url: string, limit: number, formatSelecto
       "--format",
       formatSelector,
       url,
-    ]),
+    ], allowYouTubeCookies),
   ) as PlatformMetadata;
 
   assertPlatformMetadataFits(metadata, limit, env.MAX_PLATFORM_VIDEO_SECONDS);
 }
 
-async function runYtDlp(args: string[]): Promise<string> {
+async function runYtDlp(args: string[], allowYouTubeCookies: boolean): Promise<string> {
   args = ["--js-runtimes", "node", ...args];
+  if (!allowYouTubeCookies) args = ["--ignore-config", ...args];
   const hostname = toUrl(args.at(-1) ?? "")?.hostname.toLowerCase();
-  if (hostname && (hostname === "youtu.be" || hostname === "youtube.com" || hostname.endsWith(".youtube.com")) && fs.existsSync(youtubeCookiesFile)) {
+  if (allowYouTubeCookies && hostname && (hostname === "youtu.be" || hostname === "youtube.com" || hostname.endsWith(".youtube.com")) && fs.existsSync(youtubeCookiesFile)) {
     args = ["--cookies", youtubeCookiesFile, ...args];
   }
   const controller = new AbortController();
@@ -895,8 +922,132 @@ async function assertDailyLimitAvailable(): Promise<void> {
     where: { status: "stored", createdAt: { gte: today } },
     _sum: { byteSize: true },
   });
-  const bytes = Number(aggregate._sum.byteSize ?? 0n);
+  const conversions = converterBot ? await prisma.conversionRequest.aggregate({ where: { createdAt: { gte: today } }, _sum: { byteSize: true } }) : null;
+  const bytes = Number(aggregate._sum.byteSize ?? 0n) + Number(conversions?._sum.byteSize ?? 0n);
   if (bytes >= env.MAX_DAILY_DOWNLOAD_BYTES) throw new Error("Daily download limit reached");
+}
+
+async function processOneConversionRequest(): Promise<boolean> {
+  if (!converterBot || !env.TELEGRAM_STORAGE_CHAT_ID) return false;
+  await flushConverterRecovery();
+  const claimed = await prisma.$queryRaw<Array<{ id: string }>>`
+    UPDATE "conversion_requests" SET "status" = 'downloading', "updatedAt" = NOW()
+    WHERE "id" = (
+      SELECT "id" FROM "conversion_requests" WHERE "status" = 'pending'
+      ORDER BY "createdAt" ASC FOR UPDATE SKIP LOCKED LIMIT 1
+    ) RETURNING "id"
+  `;
+  if (!claimed[0]) return false;
+  const request = await prisma.conversionRequest.findUnique({ where: { id: claimed[0].id }, include: { owner: true } }).catch(async () => {
+    converterRecovery.set(claimed[0]!.id, { status: "pending" });
+    await flushConverterRecovery();
+    return undefined;
+  });
+  if (request === undefined) return false;
+  if (!request) return true;
+  const channelPost = Boolean(request.channelPostKey);
+  const chatId = String(request.chatId);
+  const allowed = channelPost
+    ? chatId === env.TELEGRAM_CONVERTER_TEST_CHANNEL_ID && chatId !== env.TELEGRAM_STORAGE_CHAT_ID
+    : request.owner && converterUsernames.has(request.owner.username) && request.chatId === request.ownerId;
+  if (!allowed) {
+    converterRecovery.set(request.id, { status: "failed", lastError: "Access revoked" });
+    await flushConverterRecovery();
+    return true;
+  }
+  let downloads: DownloadResult[] = [];
+  let phase: "downloading" | "storing" | "delivering" = "downloading";
+  try {
+    await assertDailyLimitAvailable();
+    downloads = await downloadMedia(request.originalUrl, false);
+    const media = downloads[0];
+    if (downloads.length !== 1 || !media) throw new MediaDownloadRejectedError("Нужен один медиафайл.");
+    const kind = media.telegramSendAsAnimation ? "animation" : media.mediaType === "image" ? "photo" : "video";
+    if (!channelPost && kind !== "video") {
+      throw new MediaDownloadRejectedError("Картинки и анимации в личном чате пока не поддерживаются.");
+    }
+    const metadata = kind === "photo" ? {} : await readVideoMetadata(media.filePath);
+    if (kind !== "photo") {
+      if (!metadata.duration || !metadata.width || !metadata.height) throw new MediaDownloadRejectedError("Не удалось определить параметры видео.");
+      if (metadata.duration > Math.min(300, env.MAX_PLATFORM_VIDEO_SECONDS)) throw new MediaDownloadRejectedError("Видео должно быть не длиннее 5 минут.");
+    }
+    const fileId = await withShaLock(`converter:${media.sha256}`, async () => {
+      const cached = await prisma.conversionRequest.findFirst({
+        where: {
+          botKey: converterBotKey, sha256: media.sha256, telegramFileId: { not: null }, storageMessageId: { not: null },
+          OR: kind === "video" ? [{ telegramMediaKind: "video" }, { telegramMediaKind: null }] : [{ telegramMediaKind: kind }],
+        },
+        select: { telegramFileId: true, storageMessageId: true },
+      });
+      const identity = { sha256: media.sha256, botKey: converterBotKey, byteSize: BigInt(media.byteSize), telegramMediaKind: kind };
+      let telegramFileId = cached?.telegramFileId;
+      let storageMessageId = cached?.storageMessageId;
+      if (!telegramFileId || !storageMessageId) {
+        await prisma.conversionRequest.update({ where: { id: request.id, status: "downloading" }, data: { status: "storing", ...identity } });
+        phase = "storing";
+        const input: ConverterMedia = {
+          type: kind, media: new InputFile(media.filePath, kind === "photo" ? `photo.${media.mimeType.split("/")[1] || "jpg"}` : "video.mp4"),
+          caption: channelPost ? `converter request=${request.id}` : `converter request=${request.id} owner=${request.ownerId}`, ...metadata,
+          ...(kind === "video" ? { supports_streaming: true } : {}),
+        };
+        const stored = await converterSendLimiter.schedule(() => sendConverterMedia(converterBot.api, env.TELEGRAM_STORAGE_CHAT_ID!, input));
+        telegramFileId = "photo" in stored ? stored.photo.at(-1)?.file_id
+          : "animation" in stored ? stored.animation.file_id : "video" in stored ? stored.video.file_id : undefined;
+        if (!telegramFileId) throw new Error("Telegram did not return stored file metadata");
+        storageMessageId = stored.message_id;
+      }
+      await prisma.conversionRequest.update({ where: { id: request.id, status: phase }, data: { status: "delivering", ...identity, telegramFileId, storageMessageId } });
+      return telegramFileId;
+    });
+    phase = "delivering";
+    let telegramMessageId: number;
+    if (channelPost) {
+      const { caption, captionLinkOffset, sourcePostedAt } = request;
+      if (caption === null || captionLinkOffset === null || !sourcePostedAt) throw new Error("Missing channel post metadata");
+      telegramMessageId = await replaceChannelPost(converterBot.api, converterSendLimiter, chatId, request.sourceMessageId, sourcePostedAt, {
+        type: kind, media: fileId, caption,
+        caption_entities: [{ type: "text_link", offset: captionLinkOffset, length: "Ссылка".length, url: request.originalUrl }],
+        ...(kind === "video" ? { supports_streaming: true } : {}),
+      }, (messageId) => prisma.conversionRequest.update({ where: { id: request.id }, data: { telegramMessageId: messageId } }));
+    } else {
+      const delivered = await converterSendLimiter.schedule(() => converterBot.api.sendVideo(chatId, fileId, {
+        supports_streaming: true,
+        reply_parameters: { message_id: request.sourceMessageId, allow_sending_without_reply: true },
+      }));
+      telegramMessageId = delivered.message_id;
+    }
+    await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "done", telegramMessageId } });
+  } catch (error) {
+    const uncertain = phase !== "downloading" && (!(error instanceof GrammyError) || error.error_code >= 500);
+    const reason = uncertain ? converterUncertainMessage
+      : channelPost && phase === "delivering" && error instanceof GrammyError ? `Telegram отклонил ${error.method}: ${error.description}`
+      : phase !== "downloading" ? "Telegram отклонил отправку видео. Проверь права бота в приватном хранилище."
+      : error instanceof MediaDownloadRejectedError ? error.message : "Не удалось скачать видео. Проверь, что ссылка публичная и ролик не длиннее 5 минут.";
+    if (channelPost) console.warn(`[converter] channel post ${chatId}/${request.sourceMessageId}: ${reason}`);
+    converterRecovery.set(request.id, { status: uncertain ? "uncertain" : "failed", lastError: reason, chatId: channelPost ? undefined : chatId });
+    await flushConverterRecovery();
+  } finally {
+    await Promise.all(downloads.map((item) => fs.promises.rm(item.filePath, { force: true }).catch(() => undefined)));
+  }
+  return true;
+}
+
+function flushConverterRecovery(): Promise<void> {
+  if (converterRecoveryTask) return converterRecoveryTask;
+  // Serialize recovery across slots; failed writes stay queued until the database returns.
+  converterRecoveryTask = (async () => {
+    for (const [id, recovery] of converterRecovery) {
+      const { chatId, ...data } = recovery;
+      await prisma.conversionRequest.update({ where: { id }, data });
+      converterRecovery.delete(id);
+      if (chatId && recovery.lastError && converterBot) {
+        await converterSendLimiter.schedule(() => converterBot.api.sendMessage(chatId, recovery.lastError!)).catch(() => {
+          logServiceAlert({ code: "converter_notification_failed", title: "Не удалось уведомить о конвертации", component: "converter", error: new Error("Converter notification failed"), details: { request_id: id } });
+        });
+      }
+    }
+  })().finally(() => { converterRecoveryTask = null; });
+  return converterRecoveryTask;
 }
 
 async function markBlocked(jobId: string, chatPostId: string, reason: string): Promise<void> {

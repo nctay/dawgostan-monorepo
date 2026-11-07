@@ -5,6 +5,7 @@ import { allowedUserIds, env, privateStreamerLogins } from "./env.js";
 import { prisma } from "./prisma.js";
 import { SerialRateLimiter, withTelegramRetry } from "./rate-limit.js";
 import { logBotAlert } from "./alert-log.js";
+import { createConverterBot } from "./converter.js";
 
 const pageSize = 10;
 const publicPageSize = 50;
@@ -195,6 +196,12 @@ if (publicBot) {
   publicBot.catch((error) => logBotError("public-bot", error));
 }
 
+const converterBot = createConverterBot();
+if (converterBot) {
+  converterBot.catch((error) => logBotError("converter-bot", new Error(error.message.replaceAll(env.TELEGRAM_CONVERTER_BOT_TOKEN!, "[redacted]"))));
+  bots.push(converterBot);
+}
+
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());
 
@@ -217,7 +224,7 @@ if (publicBot) {
   );
 }
 
-console.log(`[bot] starting admin${publicBot ? " and public" : ""}`);
+console.log(`[bot] starting admin${publicBot ? " and public" : ""}${converterBot ? " and converter" : ""}`);
 await Promise.all(bots.map((runningBot) => runningBot.start()));
 
 type MediaFilter = "all" | "image" | "video";

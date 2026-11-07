@@ -12,6 +12,9 @@ export const env = z
     TWITCH_CHANNELS: z.string().default(""),
     WTV_CHANNELS: z.string().default(""),
     TELEGRAM_BOT_TOKEN: z.string().optional(),
+    TELEGRAM_CONVERTER_BOT_TOKEN: z.string().optional(),
+    TELEGRAM_CONVERTER_ALLOWED_USERNAMES: z.string().default(""),
+    TELEGRAM_CONVERTER_TEST_CHANNEL_ID: z.string().regex(/^(?:-100\d+)?$/).default(""),
     TELEGRAM_STORAGE_CHAT_ID: z.string().optional(),
     TELEGRAM_PUBLIC_CHANNEL_ID: z.string().optional(),
     TELEGRAM_DELETED_CHANNEL_ID: z.string().optional(),
@@ -28,6 +31,16 @@ export const env = z
     NSFW_MAX_FRAMES: z.coerce.number().int().min(1).max(20).default(8),
     NSFW_ENSEMBLE_CLASSIFIER_URL: z.string().url().optional(),
     NSFW_ENSEMBLE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.8),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.TELEGRAM_CONVERTER_BOT_TOKEN) return;
+    const names = value.TELEGRAM_CONVERTER_ALLOWED_USERNAMES.split(",").map((name) => name.trim().replace(/^@/, ""));
+    if (!names.length || names.some((name) => !/^[a-zA-Z0-9_]{1,32}$/.test(name))) {
+      ctx.addIssue({ code: "custom", path: ["TELEGRAM_CONVERTER_ALLOWED_USERNAMES"], message: "Set the allowed Telegram usernames for the converter" });
+    }
+    if (!value.TELEGRAM_STORAGE_CHAT_ID || value.TELEGRAM_CONVERTER_BOT_TOKEN === value.TELEGRAM_BOT_TOKEN) {
+      ctx.addIssue({ code: "custom", path: ["TELEGRAM_CONVERTER_BOT_TOKEN"], message: "Configure private storage and a separate converter bot token" });
+    }
   })
   .parse(process.env);
 
