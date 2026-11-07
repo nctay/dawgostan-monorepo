@@ -6,6 +6,7 @@ import path from "node:path";
 
 const env = vi.hoisted(() => ({
   TELEGRAM_CONVERTER_BOT_TOKEN: "123456:converter-token", TELEGRAM_CONVERTER_ALLOWED_USERNAMES: "@Alice,bob", TELEGRAM_STORAGE_CHAT_ID: "-100storage",
+  TELEGRAM_CONVERTER_TEST_CHANNEL_ID: "-100123",
   ALLOW_PRIVATE_MEDIA_HOSTS: true, ENABLE_PLATFORM_DOWNLOADS: true, MAX_DAILY_DOWNLOAD_BYTES: 10_000_000,
   MAX_VIDEO_BYTES: 1_000_000, MAX_IMAGE_BYTES: 1_000_000, MAX_PLATFORM_VIDEO_SECONDS: 300, MAX_PARALLEL_DOWNLOADS: 1, PLATFORM_DOWNLOAD_TIMEOUT_MS: 10_000,
 }));
@@ -16,7 +17,10 @@ const db = vi.hoisted(() => ({
   conversionRequest: { findUnique: vi.fn(), findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn(), findMany: vi.fn(), aggregate: vi.fn() },
   converterUser: { findUnique: vi.fn() },
 }));
-const telegram = vi.hoisted(() => ({ sendVideo: vi.fn(), sendMessage: vi.fn() }));
+const telegram = vi.hoisted(() => ({
+  sendVideo: vi.fn(), sendMessage: vi.fn(), editMessageMedia: vi.fn(), deleteMessage: vi.fn(),
+  getMe: vi.fn(), getChatMember: vi.fn(),
+}));
 const archive = vi.hoisted(() => ({ publishStoredTelegramMedia: vi.fn(), storeTelegramMedia: vi.fn() }));
 const probe = vi.hoisted(() => vi.fn());
 vi.mock("../env.js", () => ({ env }));
@@ -53,6 +57,8 @@ describe("conversion request queue", () => {
     probe.mockResolvedValue({ width: 720, height: 1280, duration: 12 });
     telegram.sendVideo.mockResolvedValueOnce({ message_id: 101, video: { file_id: "converter-file" } }).mockResolvedValue({ message_id: 102 });
     telegram.sendMessage.mockResolvedValue({ message_id: 103 });
+    telegram.getMe.mockResolvedValue({ id: 123456 });
+    telegram.getChatMember.mockResolvedValue({ status: "administrator", can_post_messages: true, can_delete_messages: true });
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("fixture-video", { headers: { "content-type": "video/mp4" } }));
   });
 
@@ -64,6 +70,34 @@ describe("conversion request queue", () => {
     expect(archive.storeTelegramMedia).not.toHaveBeenCalled();
     expect(archive.publishStoredTelegramMedia).not.toHaveBeenCalled();
     expect(db.conversionRequest.update).toHaveBeenCalledWith({ where: { id: "request-1" }, data: expect.objectContaining({ status: "done", telegramMessageId: 102 }) });
+  });
+
+  it.each(["edited", "cannot edit", "timeout", "publish rejected", "no delete permission"])("handles a channel conversion when Telegram reports %s", async (outcome) => {
+    db.conversionRequest.findUnique.mockResolvedValue({
+      ...(await db.conversionRequest.findUnique()), owner: null, ownerId: null, chatId: -100123n,
+      channelPostKey: "-100123:1", sourcePostedAt: new Date(), caption: "Момент Ссылка", captionLinkOffset: 7,
+    });
+    db.conversionRequest.findFirst.mockResolvedValue({ telegramFileId: "cached-file", storageMessageId: 55 });
+    if (outcome === "timeout") telegram.editMessageMedia.mockRejectedValue(new Error("timeout"));
+    if (outcome === "cannot edit" || outcome === "publish rejected" || outcome === "no delete permission") {
+      telegram.editMessageMedia.mockRejectedValue(new GrammyError("Bad Request", { ok: false, error_code: 400, description: "Bad Request: message can't be edited" }, "editMessageMedia", {}));
+    }
+    if (outcome === "publish rejected") telegram.sendVideo.mockReset().mockRejectedValueOnce(new Error("timeout"));
+    if (outcome === "no delete permission") telegram.getChatMember.mockResolvedValue({ status: "administrator", can_post_messages: true, can_delete_messages: false });
+    processDownloadQueue();
+    await waitForDownloadQueue();
+    expect(telegram.editMessageMedia).toHaveBeenCalledWith("-100123", 1, {
+      type: "video", media: "cached-file", caption: "Момент Ссылка", supports_streaming: true,
+      caption_entities: [{ type: "text_link", offset: 7, length: 6, url: "https://cdn.example/video.mp4" }],
+    });
+    expect(telegram.sendVideo).toHaveBeenCalledTimes(outcome === "cannot edit" || outcome === "publish rejected" ? 1 : 0);
+    if (outcome === "cannot edit") {
+      expect(telegram.deleteMessage).toHaveBeenCalledWith("-100123", 1);
+      expect(telegram.sendVideo.mock.invocationCallOrder[0]).toBeLessThan(telegram.deleteMessage.mock.invocationCallOrder[0]!);
+    } else {
+      expect(telegram.deleteMessage).not.toHaveBeenCalled();
+    }
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
   });
 
   it("recovers a download after restart but never repeats an uncertain Telegram send", async () => {

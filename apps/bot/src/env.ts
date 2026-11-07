@@ -9,6 +9,7 @@ export const env = z
     TELEGRAM_PUBLIC_BOT_TOKEN: z.string().optional(),
     TELEGRAM_CONVERTER_BOT_TOKEN: z.string().optional(),
     TELEGRAM_CONVERTER_ALLOWED_USERNAMES: z.string().default(""),
+    TELEGRAM_CONVERTER_TEST_CHANNEL_ID: z.string().regex(/^(?:-100\d+)?$/).default(""),
     TELEGRAM_PRIVATE_STREAMER_LOGINS: z.string().default(""),
   })
   .superRefine((value, ctx) => {

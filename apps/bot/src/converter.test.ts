@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Update } from "grammy/types";
 
-const env = vi.hoisted(() => ({ TELEGRAM_CONVERTER_BOT_TOKEN: "123456:test-token", TELEGRAM_CONVERTER_ALLOWED_USERNAMES: "@Alice,BOB" }));
+const env = vi.hoisted(() => ({
+  TELEGRAM_CONVERTER_BOT_TOKEN: "123456:test-token", TELEGRAM_CONVERTER_ALLOWED_USERNAMES: "@Alice,BOB",
+  TELEGRAM_CONVERTER_TEST_CHANNEL_ID: "-100123", TELEGRAM_STORAGE_CHAT_ID: "-100999",
+}));
 const db = vi.hoisted(() => ({
   converterUser: { findUnique: vi.fn(), createMany: vi.fn() },
-  conversionRequest: { createMany: vi.fn() },
+  conversionRequest: { createMany: vi.fn(), updateMany: vi.fn() },
 }));
 vi.mock("./env.js", () => ({ env }));
 vi.mock("./prisma.js", () => ({ prisma: db }));
@@ -102,5 +105,31 @@ describe("converter bot", () => {
     await bot.handleUpdate(update);
     expect(sent).toEqual([]);
     expect(db.conversionRequest.createMany).not.toHaveBeenCalled();
+  });
+
+  it("queues a test channel post with a clickable link and the surrounding text", async () => {
+    const { bot, sent } = client();
+    const url = "https://example.com/video.mp4";
+    const prefix = "🔥 Момент ";
+    const channelPost = {
+      message_id: 42, date: 1, chat: { id: -100123, type: "channel" as const, title: "Test" },
+      text: prefix + url + "\nА вот описание",
+      entities: [{ type: "url" as const, offset: prefix.length, length: url.length }],
+    };
+    await bot.handleUpdate({ update_id: 2, channel_post: channelPost });
+    await bot.handleUpdate({ update_id: 3, channel_post: { ...channelPost, chat: { ...channelPost.chat, id: -100999 } } });
+    expect(sent).toEqual([]);
+    expect(db.conversionRequest.createMany).toHaveBeenCalledOnce();
+    expect(db.conversionRequest.createMany).toHaveBeenCalledWith({
+      skipDuplicates: true,
+      data: expect.objectContaining({
+        chatId: -100123n, sourceMessageId: 42, channelPostKey: "-100123:42",
+        originalUrl: url, caption: "🔥 Момент Ссылка\nА вот описание", captionLinkOffset: prefix.length,
+      }),
+    });
+    await bot.handleUpdate({ update_id: 4, edited_channel_post: { ...channelPost, edit_date: 2 } });
+    expect(db.conversionRequest.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { channelPostKey: "-100123:42", status: { in: ["pending", "downloading", "storing"] } },
+    }));
   });
 });

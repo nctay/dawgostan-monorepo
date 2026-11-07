@@ -14,6 +14,7 @@ export const env = z
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_CONVERTER_BOT_TOKEN: z.string().optional(),
     TELEGRAM_CONVERTER_ALLOWED_USERNAMES: z.string().default(""),
+    TELEGRAM_CONVERTER_TEST_CHANNEL_ID: z.string().regex(/^(?:-100\d+)?$/).default(""),
     TELEGRAM_STORAGE_CHAT_ID: z.string().optional(),
     TELEGRAM_PUBLIC_CHANNEL_ID: z.string().optional(),
     TELEGRAM_DELETED_CHANNEL_ID: z.string().optional(),

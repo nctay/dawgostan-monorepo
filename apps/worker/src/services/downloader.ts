@@ -18,6 +18,7 @@ import { classifyNsfw } from "./nsfw.js";
 import { resolveYandexDiskMediaUrl } from "./yandex-disk.js";
 import { logServiceAlert } from "../alert-log.js";
 import { SerialRateLimiter } from "./rate-limit.js";
+import { replaceChannelPost, sendConverterMedia, type ConverterMedia } from "./converter-channel.js";
 
 type DownloadResult = {
   filePath: string;
@@ -73,7 +74,7 @@ export async function recoverInterruptedDownloadJobs(): Promise<void> {
     const interrupted = await prisma.conversionRequest.findMany({ where: { status: { in: ["storing", "delivering"] } }, include: { owner: true } });
     for (const request of interrupted) {
       await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "uncertain", lastError: converterUncertainMessage } });
-      if (converterUsernames.has(request.owner.username)) {
+      if (request.owner && converterUsernames.has(request.owner.username)) {
         await converterSendLimiter.schedule(() => converterBot.api.sendMessage(String(request.chatId), converterUncertainMessage)).catch(() => undefined);
       }
     }
@@ -944,7 +945,12 @@ async function processOneConversionRequest(): Promise<boolean> {
   });
   if (request === undefined) return false;
   if (!request) return true;
-  if (!converterUsernames.has(request.owner.username) || request.chatId !== request.ownerId) {
+  const channelPost = Boolean(request.channelPostKey);
+  const chatId = String(request.chatId);
+  const allowed = channelPost
+    ? chatId === env.TELEGRAM_CONVERTER_TEST_CHANNEL_ID && chatId !== env.TELEGRAM_STORAGE_CHAT_ID
+    : request.owner && converterUsernames.has(request.owner.username) && request.chatId === request.ownerId;
+  if (!allowed) {
     converterRecovery.set(request.id, { status: "failed", lastError: "Access revoked" });
     await flushConverterRecovery();
     return true;
@@ -954,45 +960,71 @@ async function processOneConversionRequest(): Promise<boolean> {
   try {
     await assertDailyLimitAvailable();
     downloads = await downloadMedia(request.originalUrl, false);
-    const video = downloads[0];
-    if (downloads.length !== 1 || video?.mediaType !== "video" || video.telegramSendAsAnimation) {
-      throw new MediaDownloadRejectedError("Картинки, анимации и альбомы пока не поддерживаются.");
+    const media = downloads[0];
+    if (downloads.length !== 1 || !media) throw new MediaDownloadRejectedError("Нужен один медиафайл.");
+    const kind = media.telegramSendAsAnimation ? "animation" : media.mediaType === "image" ? "photo" : "video";
+    if (!channelPost && kind !== "video") {
+      throw new MediaDownloadRejectedError("Картинки и анимации в личном чате пока не поддерживаются.");
     }
-    const metadata = await readVideoMetadata(video.filePath);
-    if (!metadata.duration || !metadata.width || !metadata.height) throw new MediaDownloadRejectedError("Не удалось определить параметры видео.");
-    if (metadata.duration > Math.min(300, env.MAX_PLATFORM_VIDEO_SECONDS)) throw new MediaDownloadRejectedError("Видео должно быть не длиннее 5 минут.");
-    const fileId = await withShaLock(`converter:${video.sha256}`, async () => {
+    const metadata = kind === "photo" ? {} : await readVideoMetadata(media.filePath);
+    if (kind !== "photo") {
+      if (!metadata.duration || !metadata.width || !metadata.height) throw new MediaDownloadRejectedError("Не удалось определить параметры видео.");
+      if (metadata.duration > Math.min(300, env.MAX_PLATFORM_VIDEO_SECONDS)) throw new MediaDownloadRejectedError("Видео должно быть не длиннее 5 минут.");
+    }
+    const fileId = await withShaLock(`converter:${media.sha256}`, async () => {
       const cached = await prisma.conversionRequest.findFirst({
-        where: { botKey: converterBotKey, sha256: video.sha256, telegramFileId: { not: null }, storageMessageId: { not: null } },
+        where: {
+          botKey: converterBotKey, sha256: media.sha256, telegramFileId: { not: null }, storageMessageId: { not: null },
+          OR: kind === "video" ? [{ telegramMediaKind: "video" }, { telegramMediaKind: null }] : [{ telegramMediaKind: kind }],
+        },
         select: { telegramFileId: true, storageMessageId: true },
       });
-      const identity = { sha256: video.sha256, botKey: converterBotKey, byteSize: BigInt(video.byteSize) };
+      const identity = { sha256: media.sha256, botKey: converterBotKey, byteSize: BigInt(media.byteSize), telegramMediaKind: kind };
       let telegramFileId = cached?.telegramFileId;
       let storageMessageId = cached?.storageMessageId;
       if (!telegramFileId || !storageMessageId) {
-        await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "storing", ...identity } });
+        await prisma.conversionRequest.update({ where: { id: request.id, status: "downloading" }, data: { status: "storing", ...identity } });
         phase = "storing";
-        const stored = await converterSendLimiter.schedule(() => converterBot.api.sendVideo(env.TELEGRAM_STORAGE_CHAT_ID!, new InputFile(video.filePath, "video.mp4"), {
-          caption: `converter request=${request.id} owner=${request.ownerId}`, supports_streaming: true, ...metadata,
-        }));
-        telegramFileId = stored.video.file_id;
+        const input: ConverterMedia = {
+          type: kind, media: new InputFile(media.filePath, kind === "photo" ? `photo.${media.mimeType.split("/")[1] || "jpg"}` : "video.mp4"),
+          caption: channelPost ? `converter request=${request.id}` : `converter request=${request.id} owner=${request.ownerId}`, ...metadata,
+          ...(kind === "video" ? { supports_streaming: true } : {}),
+        };
+        const stored = await converterSendLimiter.schedule(() => sendConverterMedia(converterBot.api, env.TELEGRAM_STORAGE_CHAT_ID!, input));
+        telegramFileId = "photo" in stored ? stored.photo.at(-1)?.file_id
+          : "animation" in stored ? stored.animation.file_id : "video" in stored ? stored.video.file_id : undefined;
+        if (!telegramFileId) throw new Error("Telegram did not return stored file metadata");
         storageMessageId = stored.message_id;
       }
-      await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "delivering", ...identity, telegramFileId, storageMessageId } });
+      await prisma.conversionRequest.update({ where: { id: request.id, status: phase }, data: { status: "delivering", ...identity, telegramFileId, storageMessageId } });
       return telegramFileId;
     });
     phase = "delivering";
-    const delivered = await converterSendLimiter.schedule(() => converterBot.api.sendVideo(String(request.chatId), fileId, {
-      supports_streaming: true,
-      reply_parameters: { message_id: request.sourceMessageId, allow_sending_without_reply: true },
-    }));
-    await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "done", telegramMessageId: delivered.message_id } });
+    let telegramMessageId: number;
+    if (channelPost) {
+      const { caption, captionLinkOffset, sourcePostedAt } = request;
+      if (caption === null || captionLinkOffset === null || !sourcePostedAt) throw new Error("Missing channel post metadata");
+      telegramMessageId = await replaceChannelPost(converterBot.api, converterSendLimiter, chatId, request.sourceMessageId, sourcePostedAt, {
+        type: kind, media: fileId, caption,
+        caption_entities: [{ type: "text_link", offset: captionLinkOffset, length: "Ссылка".length, url: request.originalUrl }],
+        ...(kind === "video" ? { supports_streaming: true } : {}),
+      }, (messageId) => prisma.conversionRequest.update({ where: { id: request.id }, data: { telegramMessageId: messageId } }));
+    } else {
+      const delivered = await converterSendLimiter.schedule(() => converterBot.api.sendVideo(chatId, fileId, {
+        supports_streaming: true,
+        reply_parameters: { message_id: request.sourceMessageId, allow_sending_without_reply: true },
+      }));
+      telegramMessageId = delivered.message_id;
+    }
+    await prisma.conversionRequest.update({ where: { id: request.id }, data: { status: "done", telegramMessageId } });
   } catch (error) {
-    const uncertain = phase !== "downloading" && !(error instanceof GrammyError);
+    const uncertain = phase !== "downloading" && (!(error instanceof GrammyError) || error.error_code >= 500);
     const reason = uncertain ? converterUncertainMessage
+      : channelPost && phase === "delivering" && error instanceof GrammyError ? `Telegram отклонил ${error.method}: ${error.description}`
       : phase !== "downloading" ? "Telegram отклонил отправку видео. Проверь права бота в приватном хранилище."
       : error instanceof MediaDownloadRejectedError ? error.message : "Не удалось скачать видео. Проверь, что ссылка публичная и ролик не длиннее 5 минут.";
-    converterRecovery.set(request.id, { status: uncertain ? "uncertain" : "failed", lastError: reason, chatId: String(request.chatId) });
+    if (channelPost) console.warn(`[converter] channel post ${chatId}/${request.sourceMessageId}: ${reason}`);
+    converterRecovery.set(request.id, { status: uncertain ? "uncertain" : "failed", lastError: reason, chatId: channelPost ? undefined : chatId });
     await flushConverterRecovery();
   } finally {
     await Promise.all(downloads.map((item) => fs.promises.rm(item.filePath, { force: true }).catch(() => undefined)));
