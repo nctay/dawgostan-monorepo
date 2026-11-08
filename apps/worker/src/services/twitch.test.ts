@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Prisma } from "@prisma/client";
 import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, stripSkipTelegramPublicTag } from "./chat-filter.js";
 import { isWithinOfflineGrace } from "./stream-grace.js";
 
@@ -207,6 +208,38 @@ describe("twitch media ingestion", () => {
     vi.resetModules();
     vi.resetAllMocks();
     envMock.ALLOW_PRIVATE_MEDIA_HOSTS = false;
+  });
+
+  it.each(["blocked", "stored"])("continues past a duplicate %s post to queue the next URL", async (status) => {
+    const { ingestChatMessage } = await import("./twitch.js");
+    prismaMock.streamer.findUnique.mockResolvedValue({ id: "streamer-1", login: "streamer" });
+    prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
+    if (status === "blocked") {
+      prismaMock.blockedMedia.findUnique.mockResolvedValueOnce({ id: "blocked-1" });
+    } else {
+      prismaMock.asset.findUnique.mockResolvedValueOnce({ id: "stored-asset", status: "stored" });
+    }
+    prismaMock.chatPost.create
+      .mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError("Unique constraint failed on twitchMessageId", {
+        code: "P2002",
+        clientVersion: Prisma.prismaVersion.client,
+        meta: { target: ["twitchMessageId"] },
+      }))
+      .mockResolvedValueOnce({ id: "post-2" });
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-2" });
+
+    await ingestChatMessage({
+      streamerLogin: "streamer",
+      twitchMessageId: "message-1",
+      authorName: "Viewer",
+      messageText: "https://youtu.be/abc123 https://example.com/next.jpg",
+      postedAt: new Date("2026-06-12T10:04:00Z"),
+    });
+
+    expect(publishStoredTelegramMediaMock).not.toHaveBeenCalled();
+    expect(prismaMock.downloadJob.create).toHaveBeenCalledExactlyOnceWith({
+      data: { assetId: "asset-2", chatPostId: "post-2", url: "https://example.com/next.jpg", status: "pending" },
+    });
   });
 
   it.each(["https://youtu.be/abc123", "https://www.instagram.com/reel/Chunk8-jurw/?igsh=shared"])("queues media with its public Telegram skip flag: %s", async (url) => {

@@ -1,5 +1,6 @@
 import tmi from "tmi.js";
 import WebSocket from "ws";
+import { Prisma } from "@prisma/client";
 import { extractUrls, normalizeUrl, toUrl } from "@dawgostan/core";
 import { prisma } from "../prisma.js";
 import { env, privateStreamerLogins } from "../env.js";
@@ -600,27 +601,10 @@ export async function ingestChatMessage(input: {
     console.log(`[chat] media-url author=${input.authorName} url=${rawUrl} normalized=${normalizedUrl}`);
 
     const blocked = await prisma.blockedMedia.findUnique({ where: { normalizedUrl } });
-    if (blocked) {
-      await prisma.chatPost.create({
-        data: {
-          streamSessionId: session.id,
-          twitchMessageId: input.twitchMessageId ? `${input.twitchMessageId}:${normalizedUrl}` : undefined,
-          rawTwitchMessageId: input.twitchMessageId,
-          authorTwitchId: input.authorTwitchId,
-          authorName: input.authorName,
-          messageText: input.messageText,
-          originalUrl: rawUrl,
-          normalizedUrl,
-          postedAt: input.postedAt,
-          skipTelegramPublic,
-          status: "blocked",
-        },
-      });
-      continue;
-    }
-
-    const existingAsset = await prisma.asset.findUnique({ where: { normalizedUrl } });
-    const reusableAsset = existingAsset?.status === "stored" ? existingAsset : await findStoredAssetForNormalizedUrl(normalizedUrl);
+    const existingAsset = blocked ? null : await prisma.asset.findUnique({ where: { normalizedUrl } });
+    const reusableAsset = blocked || existingAsset?.status === "stored"
+      ? existingAsset
+      : await findStoredAssetForNormalizedUrl(normalizedUrl);
     const post = await prisma.chatPost.create({
       data: {
         streamSessionId: session.id,
@@ -634,9 +618,20 @@ export async function ingestChatMessage(input: {
         postedAt: input.postedAt,
         assetId: reusableAsset?.id ?? existingAsset?.id,
         skipTelegramPublic,
-        status: reusableAsset ? "stored" : "pending",
+        status: blocked ? "blocked" : reusableAsset ? "stored" : "pending",
       },
+    }).catch((error: unknown) => {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === "P2002" &&
+        Array.isArray(error.meta?.target) &&
+        error.meta.target.includes("twitchMessageId")
+      ) {
+        return null;
+      }
+      throw error;
     });
+    if (!post || blocked) continue;
 
     if (reusableAsset) {
       console.log(`[download] reused asset=${reusableAsset.id} chatPost=${post.id}`);
