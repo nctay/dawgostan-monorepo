@@ -4,6 +4,7 @@
 
 - [Архитектура](architecture.md) — сервисы, пакеты, БД.
 - [Media pipeline](media-pipeline.md) — путь от чата до Telegram.
+- [NSFW-фильтр](nsfw.md) — правило спойлера, выбор кадров и история моделей.
 - [Конфигурация](configuration.md) — env и GitHub secrets.
 - [Эксплуатация](operations.md) — запуск, deploy, VPS, backup, recovery.
 

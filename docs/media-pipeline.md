@@ -53,7 +53,7 @@ Telegram normalization:
 
 ## 6. NSFW
 
-Image использует 1 кадр; video/animation — до `NSFW_MAX_FRAMES`. Spoiler включается, если Owen или SigLIP score достигает `NSFW_ENSEMBLE_THRESHOLD`. Ошибка/timeout/invalid response тоже включает spoiler. Без classifier URL проверка выключена.
+Worker проверяет новые медиа перед отправкой в storage и сохраняет флаг спойлера для публикации в публичном канале. [Правило, выборка кадров и история моделей](nsfw.md).
 
 ## 7. Telegram
 
