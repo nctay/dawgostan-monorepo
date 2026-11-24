@@ -695,6 +695,26 @@ describe.skipIf(!databaseUrl)("chat ingestion on PostgreSQL", () => {
     expect(await db.downloadJob.count({ where: { url, status: "pending" } })).toBe(1);
   });
 
+  it.each(["blocked", "stored"])("queues a fresh URL after a replayed %s post in the same message", async status => {
+    const first = `${urlPrefix}replayed.jpg`;
+    const fresh = `${urlPrefix}fresh-after-replay.jpg`;
+    if (status === "blocked") {
+      await db.blockedMedia.create({ data: { normalizedUrl: first, reason: "fixture" } });
+    } else {
+      await db.asset.create({ data: { normalizedUrl: first, originalUrl: first, status: "stored" } });
+    }
+    await receive(`#${login}`, { id: "partial-replay" }, first, false);
+    await receive(`#${login}`, { id: "partial-replay" }, `${first} ${fresh}`, false);
+    const posts = await db.chatPost.findMany({ where: { streamSessionId: sessionId } });
+    expect(posts).toHaveLength(2);
+    expect(posts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ normalizedUrl: first, status }),
+      expect.objectContaining({ normalizedUrl: fresh, status: "pending" }),
+    ]));
+    const jobs = await db.downloadJob.findMany({ where: { chatPost: { streamSessionId: sessionId } } });
+    expect(jobs.map(job => job.url)).toEqual([fresh]);
+  });
+
   it("preserves blocked and stored posts and ignores replayed message IDs", async () => {
     const canonical = `${urlPrefix}stored.jpg`;
     const alias = `${urlPrefix}alias.jpg`;
