@@ -13,8 +13,8 @@ vi.mock("grammy", () => ({
     api = apiMock;
   },
   InputFile: class {
-    constructor(...args: unknown[]) {
-      inputFileMock(...args);
+    constructor(readonly source: unknown, ...args: unknown[]) {
+      inputFileMock(source, ...args);
     }
   },
 }));
@@ -169,12 +169,89 @@ describe("Telegram media spoilers", () => {
 
       expect(apiMock.sendMediaGroup.mock.calls[0]?.[1]).toEqual([
         expect.objectContaining({ type: "photo" }),
-        expect.objectContaining({ type: "video", width: 16, height: 16, duration: 1, supports_streaming: true }),
+        expect.objectContaining({ type: "video", width: 16, height: 16, duration: 1, supports_streaming: true, cover: expect.anything(), thumbnail: expect.anything() }),
       ]);
       expect(stored.telegramFileIds).toEqual(["photo-1", "video-2"]);
       expect(stored.telegramMediaTypes).toEqual(["photo", "video"]);
     } finally {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps metadata when ffprobe takes longer than the optional cover timeout", async () => {
+    const { readVideoMetadata } = await import("./telegram-storage.js");
+    const bin = await fs.promises.mkdtemp(path.join(os.tmpdir(), "archive-slow-probe-"));
+    try {
+      const script = `#!/usr/bin/env node
+setTimeout(() => console.log('{"streams":[{"width":64,"height":32}],"format":{"duration":"4"}}'), 10_100);
+`;
+      await fs.promises.writeFile(path.join(bin, "ffprobe"), script, { mode: 0o755 });
+      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
+      expect(await readVideoMetadata("slow.mp4", false)).toEqual({ width: 64, height: 32, duration: 4 });
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.promises.rm(bin, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("bounds video preparation across two simultaneous albums and keeps every file when a cover fails", async () => {
+    const { storeTelegramMediaGroup } = await import("./telegram-storage.js");
+    const bin = await fs.promises.mkdtemp(path.join(os.tmpdir(), "archive-cover-test-"));
+    const log = path.join(bin, "calls");
+    const metadata = {
+      originalUrl: "https://example.com/album", normalizedUrl: "https://example.com/album", sha256: "hash",
+      streamerLogin: "streamer", streamerDisplayName: "Streamer", streamStartedAt: new Date(0),
+      streamSessionId: "session", assetId: "asset", authorName: "viewer", messageText: "", skipTelegramPublic: false,
+    };
+    const albums = ["left", "right"].map(name => Array.from({ length: 10 }, (_, i) => ({
+      filePath: `${name}-${i}.mp4`, mimeType: "video/mp4", mediaType: "video" as const,
+      ...(name === "left" ? { videoMetadata: { width: 48, height: 32, duration: 4 } } : {}),
+    })));
+    try {
+      // Each process records its lifetime. The shared log spans both storage calls.
+      const script = `#!/bin/sh
+tool=\${0##*/}
+prev=
+for arg in "$@"; do
+  if [ "$tool" = ffprobe ] || [ "$prev" = -i ]; then file=$arg; fi
+  prev=$arg
+done
+printf '+ %s %s\\n' "$tool" "$file" >> "$COVER_PROCESS_LOG"
+sleep 0.04
+printf '%s %s %s\\n' '-' "$tool" "$file" >> "$COVER_PROCESS_LOG"
+if [ "$tool" = ffprobe ]; then echo '{"streams":[{"width":64,"height":32}],"format":{"duration":"4"}}'
+elif [ "$file" = left-3.mp4 ]; then exit 1
+else printf jpeg; fi
+`;
+      for (const tool of ["ffmpeg", "ffprobe"]) await fs.promises.writeFile(path.join(bin, tool), script, { mode: 0o755 });
+      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
+      vi.stubEnv("COVER_PROCESS_LOG", log);
+      apiMock.sendMediaGroup.mockImplementation(async (_chatId, media: Array<{ media: { source: string } }>) =>
+        media.map((item, i) => ({ chat: { id: -100 }, message_id: i + 1, video: { file_id: item.media.source, file_unique_id: item.media.source } })));
+      const stored = await Promise.all(albums.map(files => storeTelegramMediaGroup(files, metadata)));
+      expect(stored.map(album => album.telegramFileIds)).toEqual(albums.map(files => files.map(file => file.filePath)));
+      const calls = (await fs.promises.readFile(log, "utf8")).trim().split("\n");
+      let active = 0;
+      let peak = 0;
+      for (const call of calls) {
+        active += call.startsWith("+") ? 1 : -1;
+        peak = Math.max(peak, active);
+      }
+      expect(peak).toBeLessThanOrEqual(2);
+      expect(active).toBe(0);
+      expect(calls.filter(call => call.startsWith("+ ffprobe ")).sort()).toEqual(albums[1]!.map(f => `+ ffprobe ${f.filePath}`).sort());
+      expect(calls.filter(call => call.startsWith("+ ffmpeg "))).toHaveLength(20);
+      for (const [, media] of apiMock.sendMediaGroup.mock.calls) {
+        for (const [i, item] of media.entries()) {
+          const file = item.media.source as string;
+          expect(item.width).toBe(file.startsWith("left-") ? 48 : 64);
+          expect(Boolean(item.cover && item.thumbnail)).toBe(file !== "left-3.mp4");
+          expect(Boolean(item.caption)).toBe(i === 0);
+        }
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.promises.rm(bin, { recursive: true, force: true });
     }
   });
 
@@ -508,6 +585,7 @@ describe("Telegram media spoilers", () => {
           publicTelegramChatId: "-100public",
           publicTelegramMessageId: 43,
           publicTelegramPublishedAt: new Date("2026-10-15T12:00:00Z"),
+          publicTelegramConfirmedAt: new Date("2026-10-15T12:00:00Z"),
         },
       });
     } finally {

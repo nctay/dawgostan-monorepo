@@ -5,9 +5,11 @@ import { extractUrls, normalizeUrl, toUrl } from "@dawgostan/core";
 import { prisma } from "../prisma.js";
 import { env, privateStreamerLogins } from "../env.js";
 import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, stripSkipTelegramPublicTag } from "./chat-filter.js";
+import { prepareWtvMessage, resolveWtvRedirect } from "./wtv-short-links.js";
+import { saveChatMediaPost } from "./chat-media-post.js";
 import { isWithinOfflineGrace, offlineGraceMs } from "./stream-grace.js";
 import { publishDeletedChatMessage, publishStoredTelegramMedia } from "./telegram-storage.js";
-import { isSupportedMediaCandidateUrl, resolveSupportedMediaUrl } from "./redirect-resolver.js";
+import { isShortLinkUrl, isSupportedMediaCandidateUrl, resolveSupportedMediaUrl, TemporaryShortLinkError } from "./redirect-resolver.js";
 import { logServiceAlert } from "../alert-log.js";
 
 type TwitchStream = {
@@ -17,6 +19,26 @@ type TwitchStream = {
   user_name: string;
   title: string;
   started_at: string;
+};
+
+type ChatMessageInput = {
+  streamerLogin: string;
+  twitchMessageId?: string;
+  authorTwitchId?: string;
+  authorLogin?: string;
+  authorName: string;
+  messageText: string;
+  postedAt: Date;
+  skipTelegramPublic?: boolean;
+  wtvSessionId?: string;
+  wtvCandidateUrls?: string[];
+  signal?: AbortSignal;
+};
+
+type ChatMessageContext = {
+  streamSessionId: string | null;
+  startedAt: Date | null;
+  youtubeDisabledUntil: Date | null;
 };
 
 type EventSubMessage = {
@@ -44,20 +66,48 @@ let appToken: { value: string; expiresAt: number } | null = null;
 let chatClient: InstanceType<typeof tmi.Client> | null = null;
 let chatConnecting = false;
 let nextChatMembershipCheckAt = 0;
+let nextProfileSyncAt = 0;
+const profileSyncIntervalMs = 60 * 60 * 1000;
+const twitchRequestTimeoutMs = 15_000;
 let eventSubSocket: WebSocket | null = null;
+const twitchEvents = new Set<Promise<void>>();
+const twitchShutdown = new AbortController();
 let lastChatMessageCleanupAt = 0;
 const chatMessageCleanupIntervalMs = 5 * 60 * 1000;
 const chatMembershipCheckIntervalMs = 15_000;
 const chatInitialJoinIntervalMs = 2_000;
 
-export async function pollTwitchStreams(): Promise<void> {
-  if (!env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET || channelLogins().length === 0) return;
-  const token = await getAppToken();
-  await syncConfiguredStreamers(token);
+function twitchDeadline(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(twitchRequestTimeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+export async function pollTwitchStreams(signal?: AbortSignal): Promise<void> {
+  const logins = channelLogins();
+  if (!logins.length) return;
+  try {
+    if (env.TWITCH_CLIENT_ID && env.TWITCH_CLIENT_SECRET) await refreshTwitchStreams(signal);
+  } finally {
+    if (!signal?.aborted) await finalizeExpiredGraceSessions(logins);
+  }
+}
+
+async function refreshTwitchStreams(signal?: AbortSignal): Promise<void> {
+  const token = await getAppToken(signal);
+  if (Date.now() >= nextProfileSyncAt) {
+    try {
+      await syncConfiguredStreamers(token, signal);
+      nextProfileSyncAt = Date.now() + profileSyncIntervalMs;
+    } catch (error) {
+      if (signal?.aborted) return;
+      logServiceAlert({ code: "twitch_profile_sync_failed", title: "Не удалось обновить профили Twitch", component: "twitch", error });
+    }
+  }
   const params = new URLSearchParams();
   for (const login of channelLogins()) params.append("user_login", login);
   const response = await fetch(`https://api.twitch.tv/helix/streams?${params}`, {
-    headers: { "Client-ID": env.TWITCH_CLIENT_ID, Authorization: `Bearer ${token}` },
+    signal: twitchDeadline(signal),
+    headers: { "Client-ID": env.TWITCH_CLIENT_ID ?? "", Authorization: `Bearer ${token}` },
   });
   if (!response.ok) throw new Error(`Twitch streams failed: ${response.status} ${await response.text()}`);
   const body = (await response.json()) as { data: TwitchStream[] };
@@ -79,30 +129,30 @@ export async function pollTwitchStreams(): Promise<void> {
     }
   }
 
-  await finalizeExpiredGraceSessions();
 }
 
-export function ensureEventSubConnected(): void {
-  if (eventSubSocket || !eventSubEnabled() || !env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET || channelLogins().length === 0) return;
+export function ensureEventSubConnected(signal?: AbortSignal): void {
+  if (twitchShutdown.signal.aborted || eventSubSocket || !eventSubEnabled() || !env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET || channelLogins().length === 0) return;
 
   console.log("[eventsub] connecting websocket");
   eventSubSocket = new WebSocket("wss://eventsub.wss.twitch.tv/ws");
   eventSubSocket.on("message", (raw) => {
-    void handleEventSubMessage(String(raw)).catch((error) =>
-      logServiceAlert({
+    if (twitchShutdown.signal.aborted) return;
+    void trackTwitchEvent(handleEventSubMessage(String(raw), signal).catch((error) => {
+      if (!signal?.aborted) logServiceAlert({
         code: "twitch_eventsub_message_failed",
         title: "Ошибка обработки Twitch EventSub",
         component: "twitch-eventsub",
         error,
-      }),
-    );
+      });
+    }));
   });
   eventSubSocket.on("close", () => {
     console.log("[eventsub] websocket closed");
     eventSubSocket = null;
-    setTimeout(ensureEventSubConnected, 10_000);
   });
   eventSubSocket.on("error", (error) => {
+    if (twitchShutdown.signal.aborted) return;
     logServiceAlert({
       code: "twitch_eventsub_socket_failed",
       title: "Соединение Twitch EventSub прервано",
@@ -114,6 +164,21 @@ export function ensureEventSubConnected(): void {
 }
 
 export async function ensureChatConnected(): Promise<void> {
+  const { signal } = twitchShutdown;
+  if (signal.aborted) return;
+  // Native WebSocket can keep waiting for an IRC handshake or a close
+  // acknowledgement. A stopped client can no longer accept any events.
+  let onStop!: () => void;
+  const stopped = new Promise<void>(resolve => { onStop = resolve; });
+  signal.addEventListener("abort", onStop, { once: true });
+  try {
+    await Promise.race([maintainChatConnection(), stopped]);
+  } finally {
+    signal.removeEventListener("abort", onStop);
+  }
+}
+
+async function maintainChatConnection(): Promise<void> {
   const channels = channelLogins();
   if (chatClient) {
     if (Date.now() < nextChatMembershipCheckAt) return;
@@ -126,21 +191,22 @@ export async function ensureChatConnected(): Promise<void> {
   chatConnecting = true;
   console.log(`[chat] connecting channels=${channels.join(",")}`);
   const useAuthenticatedChat = Boolean(env.TWITCH_BOT_USERNAME && env.TWITCH_BOT_OAUTH);
-  chatClient = createChatClient(channels, useAuthenticatedChat);
-  attachChatHandlers(chatClient);
+  const client = createChatClient(channels, useAuthenticatedChat);
 
   try {
-    await chatClient.connect();
+    await client.connect();
+    if (twitchShutdown.signal.aborted) return;
     console.log(`[chat] connected mode=${useAuthenticatedChat ? "authenticated" : "anonymous"}`);
     nextChatMembershipCheckAt = Date.now() + channels.length * chatInitialJoinIntervalMs + chatMembershipCheckIntervalMs;
   } catch (error) {
+    if (twitchShutdown.signal.aborted) return;
     const message = errorMessage(error);
     if (useAuthenticatedChat && /login authentication failed/i.test(message)) {
       console.warn("[chat] authenticated connect failed; retrying anonymous");
-      await disconnectChatClient(chatClient);
-      chatClient = createChatClient(channels, false);
-      attachChatHandlers(chatClient);
-      await chatClient.connect();
+      await disconnectChatClient(client);
+      if (twitchShutdown.signal.aborted) return;
+      await createChatClient(channels, false).connect();
+      if (twitchShutdown.signal.aborted) return;
       console.log("[chat] connected mode=anonymous");
       nextChatMembershipCheckAt = Date.now() + channels.length * chatInitialJoinIntervalMs + chatMembershipCheckIntervalMs;
       return;
@@ -176,15 +242,44 @@ async function rejoinMissingChatChannel(client: InstanceType<typeof tmi.Client>,
 }
 
 function createChatClient(channels: string[], authenticated: boolean): InstanceType<typeof tmi.Client> {
-  return new tmi.Client({
+  const client = new WorkerChatClient({
     ...(authenticated ? { identity: { username: env.TWITCH_BOT_USERNAME!, password: env.TWITCH_BOT_OAUTH! } } : {}),
     channels: [...channels],
     connection: { reconnect: true, secure: true },
   });
+  chatClient = client;
+  attachChatHandlers(client);
+  return client;
+}
+
+// tmi may still have a reconnect timer for an old client after a replacement.
+class WorkerChatClient extends tmi.Client {
+  override connect(): Promise<[string, number]> {
+    if (chatClient !== this || twitchShutdown.signal.aborted) return Promise.reject(new Error("IRC client retired"));
+    return super.connect();
+  }
+}
+
+function trackTwitchEvent(event: Promise<void>): Promise<void> {
+  twitchEvents.add(event);
+  return event.finally(() => twitchEvents.delete(event));
+}
+
+export async function stopTwitchConnections(): Promise<void> {
+  twitchShutdown.abort();
+  eventSubSocket?.terminate();
+  const client = chatClient;
+  chatClient = null;
+  if (client) void disconnectChatClient(client);
+  await Promise.allSettled(twitchEvents);
 }
 
 function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
-  client.on("message", async (channel: string, tags: Record<string, string | undefined>, message: string, self: boolean) => {
+  client.on("message", (channel, tags, message, self) => {
+    if (twitchShutdown.signal.aborted || client !== chatClient) return;
+    return trackTwitchEvent(onMessage(channel, tags, message, self));
+  });
+  async function onMessage(channel: string, tags: Record<string, string | undefined>, message: string, self: boolean) {
     const login = channel.replace(/^#/, "").toLowerCase();
     const authorName = tags["display-name"] ?? tags.username ?? "unknown";
     const urls = extractUrls(message);
@@ -194,16 +289,17 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
       console.log(`[chat] message channel=${login} author=${authorName} self=${self} urls=${urls.length} media=${mediaUrls.length} text=${JSON.stringify(preview)}`);
     }
 
+    const input: ChatMessageInput = {
+      streamerLogin: login,
+      twitchMessageId: tags.id,
+      authorTwitchId: tags["user-id"],
+      authorLogin: tags.username,
+      authorName,
+      messageText: message,
+      postedAt: new Date(),
+    };
     try {
-      await recordChatMessage({
-        streamerLogin: login,
-        twitchMessageId: tags.id,
-        authorTwitchId: tags["user-id"],
-        authorLogin: tags.username,
-        authorName,
-        messageText: message,
-        postedAt: new Date(),
-      }).catch((error) => {
+      const context = await recordChatMessage(input).catch((error) => {
         logServiceAlert({
           code: "chat_record_failed",
           title: "Не удалось сохранить сообщение чата",
@@ -211,15 +307,9 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
           context: `channel=${login}`,
           error,
         });
+        return undefined;
       });
-      await ingestChatMessage({
-        streamerLogin: login,
-        twitchMessageId: tags.id,
-        authorTwitchId: tags["user-id"],
-        authorName,
-        messageText: message,
-        postedAt: new Date(),
-      });
+      await ingestChatMessage(input, context);
     } catch (error) {
       logServiceAlert({
         code: "chat_ingest_failed",
@@ -229,13 +319,15 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
         error,
       });
     }
-  });
+  }
   const chatEvents = client as unknown as {
     on(event: "disconnected", handler: (reason: string) => void): void;
     on(event: "reconnect", handler: () => void): void;
     on(event: "notice", handler: (channel: string, msgid: string, message: string) => void): void;
   };
-  chatEvents.on("disconnected", (reason: string) => console.warn(`[chat] disconnected reason=${reason}`));
+  chatEvents.on("disconnected", (reason: string) => {
+    console.warn(`[chat] disconnected reason=${reason}`);
+  });
   chatEvents.on("reconnect", () => console.warn("[chat] reconnecting"));
   chatEvents.on("notice", (channel: string, msgid: string, message: string) => {
     if (msgid === "msg_channel_suspended" || msgid === "msg_room_not_found") {
@@ -256,21 +348,24 @@ function attachChatHandlers(client: InstanceType<typeof tmi.Client>): void {
 }
 
 async function disconnectChatClient(client: InstanceType<typeof tmi.Client>): Promise<void> {
-  const disconnect = (client as unknown as { disconnect?: () => Promise<unknown> }).disconnect;
-  if (!disconnect) return;
-  await disconnect.call(client).catch(() => undefined);
+  const transport = client as typeof client & { ws?: { terminate?: () => void }; reconnect: boolean; disconnect(): Promise<unknown> };
+  transport.reconnect = false;
+  const socket = transport.ws;
+  const closed = transport.disconnect().catch(() => undefined);
+  if (twitchShutdown.signal.aborted) socket?.terminate?.();
+  await closed;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export async function handleEventSubMessage(raw: string): Promise<void> {
+export async function handleEventSubMessage(raw: string, signal?: AbortSignal): Promise<void> {
   const message = JSON.parse(raw) as EventSubMessage;
 
   if (message.metadata.message_type === "session_welcome" && message.payload.session?.id) {
     console.log("[eventsub] session welcome");
-    await subscribeEventSub(message.payload.session.id);
+    await subscribeEventSub(message.payload.session.id, signal);
     return;
   }
 
@@ -296,7 +391,7 @@ export async function handleEventSubMessage(raw: string): Promise<void> {
       await prisma.streamSession.update({
         where: { id: active.id },
         data: {
-          twitchStreamId: active.twitchStreamId ?? event.id,
+          twitchStreamId: event.id ?? active.twitchStreamId,
           title: event.title,
           endedAt: null,
         },
@@ -331,13 +426,14 @@ export async function handleEventSubMessage(raw: string): Promise<void> {
   }
 }
 
-async function subscribeEventSub(sessionId: string): Promise<void> {
-  const token = env.TWITCH_EVENTSUB_USER_TOKEN || (await getAppToken());
+async function subscribeEventSub(sessionId: string, signal?: AbortSignal): Promise<void> {
+  const token = env.TWITCH_EVENTSUB_USER_TOKEN || (await getAppToken(signal));
   const streamers = await prisma.streamer.findMany({ where: { enabled: true, login: { in: channelLogins() } } });
   const specs = streamers.flatMap((streamer) => eventSubSubscriptionSpecs(streamer.twitchUserId));
   const results = await Promise.all(
     specs.map(async (spec) => {
       const response = await fetch("https://api.twitch.tv/helix/eventsub/subscriptions", {
+        signal: twitchDeadline(signal),
         method: "POST",
         headers: {
           "Client-ID": env.TWITCH_CLIENT_ID ?? "",
@@ -502,45 +598,44 @@ async function handleChatMessageDeleteEvent(event: EventSubEvent, deletedAt: Dat
   });
 }
 
-export async function recordChatMessage(input: {
-  streamerLogin: string;
-  twitchMessageId?: string;
-  authorTwitchId?: string;
-  authorLogin?: string;
-  authorName: string;
-  messageText: string;
-  postedAt: Date;
-}): Promise<void> {
+function chatMessageContextSql(input: ChatMessageInput) {
+  const cutoff = new Date(input.postedAt.getTime() - offlineGraceMs);
+  return Prisma.sql`
+    SELECT streamer.id AS "streamerId", streamer."youtubeDisabledUntil",
+           session.id AS "streamSessionId", session."startedAt"
+    FROM streamers AS streamer
+    LEFT JOIN stream_sessions AS session
+      ON session."streamerId" = streamer.id AND session.status = 'live'
+      AND session."startedAt" <= (${input.postedAt}::timestamptz AT TIME ZONE 'UTC')
+      AND (session."endedAt" IS NULL OR session."endedAt" > (${cutoff}::timestamptz AT TIME ZONE 'UTC'))
+    WHERE streamer.login = ${input.streamerLogin}
+    ORDER BY session."startedAt" DESC
+    LIMIT 1
+  `;
+}
+
+export async function recordChatMessage(input: ChatMessageInput): Promise<ChatMessageContext | null | undefined> {
   if (!input.twitchMessageId) return;
   if (isIgnoredChatAuthor(input.authorName) || isIgnoredChatCommand(input.messageText)) return;
 
-  const streamer = await prisma.streamer.findUnique({ where: { login: input.streamerLogin } });
-  if (!streamer) return;
-
-  const session = await getActiveOrGraceSession(streamer.id, input.postedAt);
-  if (!session) return;
-
-  await prisma.twitchChatMessage.upsert({
-    where: { streamerId_twitchMessageId: { streamerId: streamer.id, twitchMessageId: input.twitchMessageId } },
-    create: {
-      streamerId: streamer.id,
-      streamSessionId: session.id,
-      twitchMessageId: input.twitchMessageId,
-      authorTwitchId: input.authorTwitchId,
-      authorLogin: input.authorLogin,
-      authorName: input.authorName,
-      messageText: input.messageText,
-      postedAt: input.postedAt,
-    },
-    update: {
-      streamSessionId: session.id,
-      authorTwitchId: input.authorTwitchId,
-      authorLogin: input.authorLogin,
-      authorName: input.authorName,
-      messageText: input.messageText,
-      postedAt: input.postedAt,
-    },
-  });
+  const [context] = await prisma.$queryRaw<ChatMessageContext[]>`
+    WITH context AS (${chatMessageContextSql(input)}), buffered AS (
+      INSERT INTO twitch_chat_messages AS message
+        (id, "streamerId", "streamSessionId", "twitchMessageId", "authorTwitchId", "authorLogin",
+         "authorName", "messageText", "postedAt", "createdAt")
+      SELECT gen_random_uuid()::text, "streamerId", "streamSessionId", ${input.twitchMessageId},
+             ${input.authorTwitchId ?? null}, ${input.authorLogin ?? null}, ${input.authorName}, ${input.messageText},
+             ${input.postedAt}::timestamptz AT TIME ZONE 'UTC', CURRENT_TIMESTAMP AT TIME ZONE 'UTC'
+      FROM context WHERE "streamSessionId" IS NOT NULL
+      ON CONFLICT ("streamerId", "twitchMessageId") DO UPDATE SET
+        "streamSessionId" = EXCLUDED."streamSessionId", "postedAt" = EXCLUDED."postedAt",
+        "authorTwitchId" = COALESCE(EXCLUDED."authorTwitchId", message."authorTwitchId"),
+        "authorLogin" = COALESCE(EXCLUDED."authorLogin", message."authorLogin"),
+        "authorName" = EXCLUDED."authorName", "messageText" = EXCLUDED."messageText"
+    )
+    SELECT * FROM context
+  `;
+  return context ?? null;
 }
 
 export async function cleanupExpiredChatMessages(now = new Date()): Promise<number> {
@@ -554,15 +649,7 @@ export async function cleanupExpiredChatMessages(now = new Date()): Promise<numb
   return result.count;
 }
 
-export async function ingestChatMessage(input: {
-  streamerLogin: string;
-  twitchMessageId?: string;
-  authorTwitchId?: string;
-  authorName: string;
-  messageText: string;
-  postedAt: Date;
-  skipTelegramPublic?: boolean;
-}): Promise<void> {
+export async function ingestChatMessage(input: ChatMessageInput, bufferedContext?: ChatMessageContext | null): Promise<"retry" | void> {
   if (isIgnoredChatAuthor(input.authorName)) {
     console.log(`[chat] ignored author channel=${input.streamerLogin} author=${input.authorName}`);
     return;
@@ -573,131 +660,105 @@ export async function ingestChatMessage(input: {
     return;
   }
 
-  const skipTelegramPublic = input.skipTelegramPublic === true || hasSkipTelegramPublicTag(input.messageText);
-  const urls = extractUrls(skipTelegramPublic ? stripSkipTelegramPublicTag(input.messageText) : input.messageText).filter(isSupportedMediaCandidateUrl);
-  if (urls.length === 0) return;
+  let skipTelegramPublic = input.skipTelegramPublic === true || hasSkipTelegramPublicTag(input.messageText);
+  const urls = input.wtvCandidateUrls ?? extractUrls(skipTelegramPublic ? stripSkipTelegramPublicTag(input.messageText) : input.messageText).filter(isSupportedMediaCandidateUrl);
+  if (!urls.length && !input.wtvCandidateUrls) return;
 
-  const streamer = await prisma.streamer.findUnique({ where: { login: input.streamerLogin } });
-  if (!streamer) {
+  // Only a skipped or failed buffer operation needs a fresh lookup.
+  const context = bufferedContext === undefined
+    ? (await prisma.$queryRaw<ChatMessageContext[]>(chatMessageContextSql(input)))[0]
+    : bufferedContext;
+  if (!context) {
     console.warn(`[chat] ignored unknown-streamer login=${input.streamerLogin}`);
     return;
   }
 
-  const session = await getActiveOrGraceSession(streamer.id, input.postedAt);
-  if (!session) {
+  if (!context.streamSessionId || !context.startedAt) {
     console.log(`[chat] ignored offline media channel=${input.streamerLogin}`);
     return;
   }
 
-  for (const candidateUrl of urls) {
-    const rawUrl = await resolveSupportedMediaUrl(candidateUrl);
+  const wtvMessageId = input.twitchMessageId?.startsWith("wtv:") ? input.twitchMessageId : undefined;
+  let candidates = [...new Set(urls)];
+  if (input.wtvSessionId && input.wtvSessionId !== context.streamSessionId) return;
+  let pending = false;
+  if (wtvMessageId) {
+    const prepared = await prepareWtvMessage(context.streamSessionId, wtvMessageId, { ...input, skipTelegramPublic }, candidates);
+    if (!prepared) return;
+    input = { ...input, ...prepared.context };
+    skipTelegramPublic = prepared.context.skipTelegramPublic === true;
+    candidates = prepared.candidates;
+    pending = prepared.pending;
+  }
+
+  let retry = false;
+  for (const [i, candidateUrl] of candidates.entries()) {
+    if (input.signal?.aborted) return "retry";
+    let rawUrl: string | null;
+    try {
+      if (wtvMessageId && isShortLinkUrl(candidateUrl)) {
+        rawUrl = await resolveWtvRedirect(context.streamSessionId, wtvMessageId, candidateUrl, input.signal);
+      } else {
+        rawUrl = await resolveSupportedMediaUrl(candidateUrl, input.signal);
+      }
+    } catch (error) {
+      if (input.signal?.aborted) {
+        if (wtvMessageId && pending && candidates.length > 1) {
+          // Give unattempted siblings the next poll before retrying the stalled link.
+          await prisma.wtvPendingMessage.updateMany({ where: { sessionId: context.streamSessionId, messageId: wtvMessageId, sourceUrls: { equals: candidates }, skipTelegramPublic },
+            data: { sourceUrls: [...candidates.slice(i + 1), ...candidates.slice(0, i + 1)] } });
+        }
+        return "retry";
+      }
+      if (!(error instanceof TemporaryShortLinkError)) throw error;
+      retry = true;
+      continue;
+    }
     if (!rawUrl) continue;
-    if (streamer.youtubeDisabledUntil && streamer.youtubeDisabledUntil > new Date() && isYouTubeUrl(rawUrl)) {
-      console.log(`[chat] ignored youtube channel=${input.streamerLogin} until=${streamer.youtubeDisabledUntil.toISOString()}`);
+    if (context.youtubeDisabledUntil && context.youtubeDisabledUntil > new Date() && isYouTubeUrl(rawUrl)) {
+      console.log(`[chat] ignored youtube channel=${input.streamerLogin} until=${context.youtubeDisabledUntil.toISOString()}`);
       continue;
     }
     const normalizedUrl = normalizeUrl(rawUrl);
     if (!normalizedUrl) continue;
     console.log(`[chat] media-url author=${input.authorName} url=${rawUrl} normalized=${normalizedUrl}`);
 
-    const blocked = await prisma.blockedMedia.findUnique({ where: { normalizedUrl } });
-    const existingAsset = blocked ? null : await prisma.asset.findUnique({ where: { normalizedUrl } });
-    const reusableAsset = blocked || existingAsset?.status === "stored"
-      ? existingAsset
-      : await findStoredAssetForNormalizedUrl(normalizedUrl);
-    const post = await prisma.chatPost.create({
-      data: {
-        streamSessionId: session.id,
-        twitchMessageId: input.twitchMessageId ? `${input.twitchMessageId}:${normalizedUrl}` : undefined,
-        rawTwitchMessageId: input.twitchMessageId,
-        authorTwitchId: input.authorTwitchId,
-        authorName: input.authorName,
-        messageText: input.messageText,
-        originalUrl: rawUrl,
-        normalizedUrl,
-        postedAt: input.postedAt,
-        assetId: reusableAsset?.id ?? existingAsset?.id,
-        skipTelegramPublic,
-        status: blocked ? "blocked" : reusableAsset ? "stored" : "pending",
-      },
-    }).catch((error: unknown) => {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === "P2002" &&
-        Array.isArray(error.meta?.target) &&
-        error.meta.target.includes("twitchMessageId")
-      ) {
-        return null;
-      }
-      throw error;
+    const result = await saveChatMediaPost({
+      streamSessionId: context.streamSessionId,
+      twitchMessageId: input.twitchMessageId ? `${input.twitchMessageId}:${normalizedUrl}` : undefined,
+      rawTwitchMessageId: input.twitchMessageId,
+      deferPublicCopy: Boolean(wtvMessageId && env.TELEGRAM_PUBLIC_CHANNEL_ID && !privateStreamerLogins.has(input.streamerLogin.toLowerCase())),
+      authorTwitchId: input.authorTwitchId,
+      authorName: input.authorName,
+      messageText: input.messageText,
+      originalUrl: rawUrl,
+      normalizedUrl,
+      postedAt: input.postedAt,
+      skipTelegramPublic,
     });
-    if (!post || blocked) continue;
-
-    if (reusableAsset) {
-      console.log(`[download] reused asset=${reusableAsset.id} chatPost=${post.id}`);
-      await publishStoredTelegramMedia(reusableAsset, {
-        streamerLogin: streamer.login,
-        streamStartedAt: session.startedAt,
+    if (result.outcome === "stored") {
+      console.log(`[download] reused asset=${result.asset.id} chatPost=${result.postId}`);
+      if (wtvMessageId) continue; // The post transaction queued its public copy.
+      await publishStoredTelegramMedia(result.asset, {
+        streamerLogin: input.streamerLogin,
+        streamStartedAt: context.startedAt,
         authorName: input.authorName,
         messageText: input.messageText,
         skipTelegramPublic,
       });
-    } else {
-      const asset =
-        existingAsset ??
-        (await prisma.asset.upsert({
-          where: { normalizedUrl },
-          update: {},
-          create: {
-            originalUrl: rawUrl,
-            normalizedUrl,
-            mediaType: "other",
-            status: "pending",
-          },
-        }));
-
-      const activeJob = await prisma.downloadJob.findFirst({
-        where: {
-          assetId: asset.id,
-          status: { in: ["pending", "running"] },
-        },
-      });
-
-      if (activeJob) {
-        await prisma.chatPost.update({ where: { id: post.id }, data: { assetId: asset.id } });
-        console.log(`[download] duplicate pending asset=${asset.id} chatPost=${post.id}`);
-        continue;
-      }
-
-      await prisma.downloadJob.create({
-        data: {
-          assetId: asset.id,
-          chatPostId: post.id,
-          url: rawUrl,
-          status: "pending",
-        },
-      });
-      console.log(`[download] queued chatPost=${post.id} asset=${asset.id}`);
+    } else if (result.outcome === "queued" || result.outcome === "active") {
+      console.log(`[download] ${result.outcome} chatPost=${result.postId} asset=${result.assetId}`);
     }
+  }
+  if (retry) return "retry";
+  if (wtvMessageId && pending) {
+    await prisma.wtvPendingMessage.deleteMany({ where: { sessionId: context.streamSessionId, messageId: wtvMessageId, sourceUrls: { equals: candidates }, skipTelegramPublic } });
   }
 }
 
 function isYouTubeUrl(rawUrl: string): boolean {
   const hostname = toUrl(rawUrl)?.hostname.toLowerCase();
   return hostname === "youtu.be" || hostname === "youtube.com" || hostname?.endsWith(".youtube.com") === true;
-}
-
-async function findStoredAssetForNormalizedUrl(normalizedUrl: string) {
-  const post = await prisma.chatPost.findFirst({
-    where: {
-      normalizedUrl,
-      status: "stored",
-      asset: { status: "stored" },
-    },
-    orderBy: { postedAt: "asc" },
-    include: { asset: true },
-  });
-  return post?.asset ?? null;
 }
 
 async function findPostsForRawTwitchMessage(streamSessionId: string, twitchMessageId: string) {
@@ -717,11 +778,12 @@ function parseEventSubTimestamp(value: string | undefined): Date {
   return Number.isNaN(date.getTime()) ? new Date() : date;
 }
 
-async function syncConfiguredStreamers(token: string): Promise<void> {
+async function syncConfiguredStreamers(token: string, signal?: AbortSignal): Promise<void> {
   const params = new URLSearchParams();
   const logins = channelLogins();
   for (const login of logins) params.append("login", login);
   const response = await fetch(`https://api.twitch.tv/helix/users?${params}`, {
+    signal: twitchDeadline(signal),
     headers: { "Client-ID": env.TWITCH_CLIENT_ID ?? "", Authorization: `Bearer ${token}` },
   });
   if (!response.ok) throw new Error(`Twitch users failed: ${response.status} channels=${logins.join(",")} body=${await response.text()}`);
@@ -752,15 +814,15 @@ function channelLogins(): string[] {
 }
 
 async function getActiveOrGraceSession(streamerId: string, seenAt: Date) {
-  const active = await prisma.streamSession.findFirst({
+  return prisma.streamSession.findFirst({
     where: {
       streamerId,
       status: "live",
       OR: [{ endedAt: null }, { endedAt: { gte: new Date(seenAt.getTime() - offlineGraceMs) } }],
     },
     orderBy: { startedAt: "desc" },
+    select: { id: true, startedAt: true },
   });
-  return active;
 }
 
 async function upsertLiveStreamer(stream: TwitchStream): Promise<void> {
@@ -797,7 +859,7 @@ async function upsertLiveStreamer(stream: TwitchStream): Promise<void> {
     await prisma.streamSession.update({
       where: { id: active.id },
       data: {
-        twitchStreamId: active.twitchStreamId ?? stream.id,
+        twitchStreamId: stream.id,
         title: stream.title,
         startedAt: active.startedAt,
         endedAt: null,
@@ -824,18 +886,19 @@ async function markStreamerOffline(login: string) {
   });
 }
 
-async function finalizeExpiredGraceSessions(): Promise<void> {
+async function finalizeExpiredGraceSessions(logins: string[]): Promise<void> {
   const cutoff = new Date(Date.now() - offlineGraceMs);
   const update = await prisma.streamSession.updateMany({
-    where: { status: "live", endedAt: { lt: cutoff } },
+    where: { streamer: { login: { in: logins }, NOT: { twitchUserId: { startsWith: "wtv:" } } }, status: "live", endedAt: { lt: cutoff } },
     data: { status: "ended" },
   });
   if (update.count > 0) console.log(`[twitch] finalized grace sessions=${update.count}`);
 }
 
-async function getAppToken(): Promise<string> {
+async function getAppToken(signal?: AbortSignal): Promise<string> {
   if (appToken && appToken.expiresAt > Date.now() + 60_000) return appToken.value;
   const response = await fetch("https://id.twitch.tv/oauth2/token", {
+    signal: twitchDeadline(signal),
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({

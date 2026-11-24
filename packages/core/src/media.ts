@@ -18,6 +18,14 @@ const URL_PATTERN =
   /\b(?:(?:https?:\/\/|www\.)[^\s<>"'`]+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'`]*)?)/gi;
 const TRAILING_PUNCTUATION = /[),.;:!?]+$/;
 
+export function hasSkipTelegramPublicTag(messageText: string): boolean {
+  return /!skip_tg(?=https?:\/\/|www\.|\s|$)/i.test(messageText);
+}
+
+export function stripSkipTelegramPublicTag(messageText: string): string {
+  return messageText.replace(/!skip_tg(?=https?:\/\/|www\.|\s|$)/gi, " ").replace(/\s+/g, " ").trim();
+}
+
 export function extractUrls(text: string): string[] {
   return [...(text.match(URL_PATTERN) ?? [])]
     .map((url) => url.replace(TRAILING_PUNCTUATION, ""))

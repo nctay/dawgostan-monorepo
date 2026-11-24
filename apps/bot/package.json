@@ -13,11 +13,14 @@
   },
   "dependencies": {
     "@dawgostan/core": "workspace:*",
+    "@grammyjs/runner": "^2.0.3",
     "@prisma/client": "^6.10.1",
     "grammy": "^1.38.1",
+    "node-fetch": "2.7.0",
     "zod": "^3.25.67"
   },
   "devDependencies": {
+    "@types/node-fetch": "^2.6.13",
     "vitest": "^3.2.4"
   }
 }

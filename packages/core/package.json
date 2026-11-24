@@ -9,6 +9,10 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./telegram-fetch": {
+      "types": "./src/telegram-fetch.ts",
+      "import": "./dist/telegram-fetch.js"
     }
   },
   "scripts": {
@@ -18,9 +22,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "ipaddr.js": "^2.2.0"
+    "ipaddr.js": "^2.2.0",
+    "node-fetch": "2.7.0"
   },
   "devDependencies": {
+    "@types/node-fetch": "^2.6.13",
     "vitest": "^3.2.4"
   }
 }

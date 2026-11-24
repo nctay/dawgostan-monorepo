@@ -1,13 +1,20 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { classifyNsfw } from "@dawgostan/nsfw";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { HttpError } from "grammy";
+import { convertAnimatedWebpToMp4, transcodeForTelegram } from "@dawgostan/media-processing";
 
 const prismaMock = vi.hoisted(() => ({
   $queryRaw: vi.fn(),
+  $executeRaw: vi.fn(),
   $transaction: vi.fn(),
   blockedMedia: { findUnique: vi.fn() },
-  downloadJob: { findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
+  downloadJob: { findUnique: vi.fn(), findMany: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   chatPost: { findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   asset: { aggregate: vi.fn(), findUnique: vi.fn(), updateMany: vi.fn(), upsert: vi.fn() },
 }));
@@ -19,6 +26,7 @@ const readVideoMetadataMock = vi.hoisted(() => vi.fn());
 const readVideoCodecMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../env.js", () => ({
+  privateStreamerLogins: new Set(),
   env: {
     ALLOW_PRIVATE_MEDIA_HOSTS: true,
     ENABLE_PLATFORM_DOWNLOADS: true,
@@ -79,6 +87,7 @@ describe("download failure cleanup", () => {
   it("recovers interrupted jobs only when Telegram has no stored media record", async () => {
     const { recoverInterruptedDownloadJobs } = await import("./downloader.js");
     prismaMock.downloadJob.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.downloadJob.findMany.mockResolvedValue([]);
 
     await recoverInterruptedDownloadJobs();
 
@@ -88,7 +97,7 @@ describe("download failure cleanup", () => {
         updatedAt: { gte: expect.any(Date) },
         asset: {
           is: {
-            status: "pending",
+            status: { in: ["pending", "failed"] },
             sha256: null,
             telegramMessageId: null,
             telegramMessageIds: { isEmpty: true },
@@ -129,6 +138,28 @@ describe("download failure cleanup", () => {
     });
   });
 
+  it.each([1, 3])("redacts Telegram network errors in logs and saved download attempt %i", async attempts => {
+    const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+    const job = await prismaMock.downloadJob.findUnique();
+    prismaMock.downloadJob.findUnique.mockResolvedValue({ ...job, attempts, url: job.chatPost.normalizedUrl });
+    prismaMock.asset.findUnique.mockResolvedValue({ id: job.assetId, status: "stored" });
+    const token = "4567:worker_fixture";
+    publishStoredTelegramMediaMock.mockRejectedValue(new HttpError("Network request failed",
+      new Error(`request to https://api.telegram.org/bot${token}/copyMessage failed: ECONNRESET`)));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      processDownloadQueue();
+      await waitForDownloadQueue();
+      const lastError = prismaMock.downloadJob.update.mock.calls.at(-1)?.[0].data.lastError;
+      expect(lastError).toContain("/bot[redacted]/copyMessage failed: ECONNRESET");
+      const logs = [...warn.mock.calls, ...vi.mocked(console.error).mock.calls].flat().join("\n");
+      expect(logs).toContain("ECONNRESET");
+      expect(logs).not.toContain(token);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("claims another job when one download slot is still busy", async () => {
     const { env } = await import("../env.js");
     const previousSlots = env.MAX_PARALLEL_DOWNLOADS;
@@ -136,12 +167,9 @@ describe("download failure cleanup", () => {
     const fixture = await prismaMock.downloadJob.findUnique();
     let releaseSlow: () => void = () => undefined;
     const slowJob = new Promise((resolve) => { releaseSlow = () => resolve({ ...fixture, id: "slow" }); });
-    prismaMock.$queryRaw.mockReset()
-      .mockResolvedValueOnce([{ id: "slow" }])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: "fast" }])
-      .mockResolvedValueOnce([{ id: "later" }])
-      .mockResolvedValue([]);
+    const claims = [[{ id: "slow" }], [], [{ id: "fast" }], [{ id: "later" }]];
+    prismaMock.$queryRaw.mockReset().mockImplementation(async (sql: TemplateStringsArray) =>
+      sql.join("").includes('UPDATE "download_jobs"') ? claims.shift() ?? [] : []);
     prismaMock.downloadJob.findUnique.mockImplementation(({ where }: { where: { id: string } }) =>
       where.id === "slow" ? slowJob : Promise.resolve({ ...fixture, id: where.id }),
     );
@@ -151,9 +179,8 @@ describe("download failure cleanup", () => {
     try {
       await vi.waitFor(() => {
         processDownloadQueue();
-        expect(prismaMock.$queryRaw.mock.calls.length).toBeGreaterThanOrEqual(5);
+        expect(prismaMock.downloadJob.findUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { id: "later" } }));
       });
-      expect(prismaMock.downloadJob.findUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { id: "later" } }));
     } finally {
       releaseSlow();
       await waitForDownloadQueue();
@@ -164,6 +191,14 @@ describe("download failure cleanup", () => {
 });
 
 describe("platform download lifecycle", () => {
+  const storedMedia = {
+    storageProvider: "telegram",
+    telegramChatId: "-100storage",
+    telegramMessageId: 1,
+    telegramFileId: "file",
+    telegramFileUniqueId: "unique",
+  };
+
   beforeEach(() => {
     vi.resetAllMocks();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -203,17 +238,51 @@ describe("platform download lifecycle", () => {
     });
     readVideoCodecMock.mockResolvedValue("h264");
     readVideoMetadataMock.mockResolvedValue({ duration: 10 });
-    storeTelegramMediaMock.mockResolvedValue({
-      storageProvider: "telegram",
-      telegramChatId: "-100storage",
-      telegramMessageId: 1,
-      telegramFileId: "file",
-      telegramFileUniqueId: "unique",
-    });
+    storeTelegramMediaMock.mockResolvedValue(storedMedia);
     publishStoredTelegramMediaMock.mockResolvedValue(undefined);
   });
 
-  it.each(["https://clips.twitch.tv/FixtureClip", "https://www.instagram.com/reel/FixtureReel/"])("stores and publishes a compatible platform video: %s", async (url) => {
+  it("stores the JPEG from a short link whose .jpg redirect leads to a Postimage page", async () => {
+    const short = "https://bit.ly/fixture";
+    const intermediate = "https://media.example/photo.jpg";
+    const page = "https://postimg.cc/abcd";
+    const photo = "https://i.postimg.cc/abcd/photo.jpg";
+    const network = vi.fn(async (input: URL | string) => {
+      switch (String(input)) {
+        case short: return Response.redirect(intermediate);
+        case intermediate: return Response.redirect(page);
+        case page: return new Response(`<meta property="og:image" content="${photo}">`);
+        case photo: return new Response("fixture-jpeg", { headers: { "content-type": "image/jpeg" } });
+        default: throw new Error("Unexpected fixture URL");
+      }
+    });
+    vi.stubGlobal("fetch", network);
+    try {
+      const { resolveSupportedMediaUrl } = await import("./redirect-resolver.js");
+      const url = await resolveSupportedMediaUrl(short);
+      const job = await prismaMock.downloadJob.findUnique();
+      prismaMock.downloadJob.findUnique.mockResolvedValue({ ...job, url, chatPost: { ...job.chatPost, normalizedUrl: url } });
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(storeTelegramMediaMock).toHaveBeenCalledWith(expect.any(String), "image/jpeg", "image", expect.any(Object));
+      expect(network.mock.calls.filter(([input]) => String(input) === photo)).toHaveLength(1);
+      expect(url).toBe(page);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    ["https://clips.twitch.tv/FixtureClip", "h264"],
+    ["https://www.instagram.com/reel/FixtureReel/", "h264"],
+    ["https://clips.twitch.tv/FixtureClip", "hevc"],
+  ])("stores a platform video and reuses metadata only for an unchanged file: %s %s", async (url, codec) => {
+    const videoMetadata = { duration: 10, width: 320, height: 180 };
+    readVideoMetadataMock.mockResolvedValue(videoMetadata);
+    readVideoCodecMock.mockResolvedValue(codec);
+    vi.mocked(transcodeForTelegram).mockImplementation((_input, output) => fs.promises.writeFile(output, "converted"));
     const job = await prismaMock.downloadJob.findUnique();
     prismaMock.downloadJob.findUnique.mockResolvedValue({
       ...job,
@@ -248,7 +317,8 @@ if (args.includes("--dump-json")) {
       await waitForDownloadQueue();
 
       expect(storeTelegramMediaMock).toHaveBeenCalledOnce();
-      expect(storeTelegramMediaMock).toHaveBeenCalledWith(expect.any(String), "video/mp4", "video", expect.objectContaining({ originalUrl: url }));
+      expect(storeTelegramMediaMock).toHaveBeenCalledWith(expect.any(String), "video/mp4", "video",
+        expect.objectContaining({ originalUrl: url, videoMetadata: codec === "h264" ? videoMetadata : undefined }));
       expect(publishStoredTelegramMediaMock).toHaveBeenCalledOnce();
       expect(prismaMock.asset.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -311,13 +381,77 @@ if (args.includes("--dump-json")) {
     }
   });
 
+  it.each(["mp4", "gif"] as const)("hashes a direct %s once and persists the SHA-256 of the file sent to storage", async format => {
+    const url = `https://cdn.example/fixture.${format}`;
+    prismaMock.downloadJob.findUnique.mockResolvedValue({ ...(await prismaMock.downloadJob.findUnique()), url });
+    const { stdout: source } = await promisify(execFile)("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=32x32:rate=4:duration=1",
+      ...(format === "mp4" ? ["-c:v", "libx264", "-movflags", "frag_keyframe+empty_moov"] : []),
+      "-f", format, "pipe:1",
+    ], { encoding: "buffer" });
+    const mediaProcessing = await vi.importActual<typeof import("@dawgostan/media-processing")>("@dawgostan/media-processing");
+    vi.mocked(transcodeForTelegram).mockImplementation(mediaProcessing.transcodeForTelegram);
+    let uploaded: Buffer | undefined;
+    storeTelegramMediaMock.mockImplementationOnce(async (filePath: string) => {
+      uploaded = await fs.promises.readFile(filePath);
+      return storedMedia;
+    });
+    const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(new Uint8Array(source), {
+      headers: { "content-type": format === "mp4" ? "video/mp4" : "image/gif" },
+    }));
+    const hashes = vi.spyOn(crypto, "createHash");
+    try {
+      processDownloadQueue();
+      await waitForDownloadQueue();
+      expect(uploaded).toBeDefined();
+      expect(uploaded!.equals(source)).toBe(format === "mp4");
+      const sha256 = crypto.hash("sha256", uploaded!);
+      const asset = expect.objectContaining({ sha256, sha256s: [sha256], byteSize: uploaded!.length });
+      expect(prismaMock.asset.upsert).toHaveBeenCalledWith(expect.objectContaining({ create: asset, update: asset }));
+      expect(prismaMock.asset.findUnique).toHaveBeenCalledWith({ where: { sha256 } });
+      expect(prismaMock.blockedMedia.findUnique).toHaveBeenCalledWith({ where: { sha256 } });
+      expect(hashes.mock.calls.filter(([algorithm]) => algorithm === "sha256")).toHaveLength(1);
+    } finally {
+      hashes.mockRestore();
+      fetch.mockRestore();
+    }
+  });
+
+  it("stops a direct download at the byte limit without Content-Length and removes the partial file", async () => {
+    const url = "https://cdn.example/oversized.mp4";
+    prismaMock.downloadJob.findUnique.mockResolvedValue({ ...(await prismaMock.downloadJob.findUnique()), url });
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "archive-download-limit-"));
+    const tmpdir = vi.spyOn(os, "tmpdir").mockReturnValue(tempDir);
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(600_000));
+        controller.enqueue(new Uint8Array(600_000));
+        controller.close();
+      },
+    }), { headers: { "content-type": "video/mp4" } }));
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+      expect(prismaMock.downloadJob.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ status: "failed", lastError: "Media exceeded byte limit 1000000" }),
+      }));
+      expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+      expect(await fs.promises.readdir(tempDir)).toEqual([]);
+    } finally {
+      fetch.mockRestore();
+      tmpdir.mockRestore();
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("transcodes an HEVC MP4 before storing it in Telegram", async () => {
     prismaMock.downloadJob.findUnique.mockResolvedValue({
       ...(await prismaMock.downloadJob.findUnique()),
       url: "https://cdn.example/clip.mp4",
     });
     readVideoCodecMock.mockResolvedValue("hevc");
-    const { transcodeForTelegram } = await import("@dawgostan/media-processing");
     vi.mocked(transcodeForTelegram).mockImplementation(async (_inputPath, outputPath) => {
       await fs.promises.writeFile(outputPath, "h264-video");
     });
@@ -335,6 +469,63 @@ if (args.includes("--dump-json")) {
     } finally {
       fetchMock.mockRestore();
     }
+  });
+
+  describe.each(["gif", "webp"])("oversized %s animation", (format) => {
+    let tempDir: string;
+
+    beforeEach(async () => {
+      tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "animation-cleanup-"));
+      vi.spyOn(os, "tmpdir").mockReturnValue(tempDir);
+      const url = `https://cdn.example/animation.${format}`;
+      prismaMock.downloadJob.findUnique.mockResolvedValue({ ...(await prismaMock.downloadJob.findUnique()), url });
+      const body = format === "gif" ? "GIF89a" : "RIFF\x10\0\0\0WEBPANIM\0\0\0\0";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, { headers: { "content-type": `image/${format}` } }));
+
+      const convert = format === "gif" ? transcodeForTelegram : convertAnimatedWebpToMp4;
+      vi.mocked(convert).mockImplementationOnce(async (_input, output) => {
+        await fs.promises.writeFile(output, "");
+        await fs.promises.truncate(output, 50_000_000);
+      });
+    });
+
+    afterEach(async () => {
+      vi.mocked(globalThis.fetch).mockRestore();
+      vi.mocked(os.tmpdir).mockRestore();
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    it("removes the intermediate and partial MP4 when recompression fails", async () => {
+      vi.mocked(transcodeForTelegram).mockImplementationOnce(async (_input, output) => {
+        await fs.promises.writeFile(output, "partial video");
+        throw new Error("compression failed");
+      });
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(prismaMock.downloadJob.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ status: "pending", lastError: "compression failed" }),
+      }));
+      expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+      expect(await fs.promises.readdir(tempDir)).toEqual([]);
+    });
+
+    it("keeps only the compressed animation until Telegram storage reads it", async () => {
+      vi.mocked(transcodeForTelegram).mockImplementationOnce((_input, output) => fs.promises.writeFile(output, "compressed video"));
+      storeTelegramMediaMock.mockImplementationOnce(async (filePath: string) => {
+        expect(await fs.promises.readdir(tempDir)).toEqual([path.basename(filePath)]);
+        expect(await fs.promises.readFile(filePath, "utf8")).toBe("compressed video");
+        return storedMedia;
+      });
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(storeTelegramMediaMock).toHaveBeenCalledWith(expect.any(String), "video/mp4", "video", expect.objectContaining({ telegramSendAsAnimation: true }));
+      expect(publishStoredTelegramMediaMock).toHaveBeenCalledOnce();
+      expect(await fs.promises.readdir(tempDir)).toEqual([]);
+    });
   });
 
   it("stores all 18 images from a TikTok photo post", async () => {
@@ -484,6 +675,49 @@ describe("media album limits", () => {
         expect.objectContaining({ originalUrl: albumUrl }),
       );
       expect(storeTelegramMediaMock).not.toHaveBeenCalled();
+      expect(classifyNsfwMock).toHaveBeenCalledTimes(2);
+      expect(prismaMock.asset.upsert).toHaveBeenCalledWith(expect.objectContaining({
+        create: expect.objectContaining({ publicHasSpoiler: false }),
+      }));
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it.each(["threshold", "service error"])("stores the whole album after the first video frame triggers a spoiler: %s", async reason => {
+    const { stdout: video } = await promisify(execFile)("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "color=size=32x32:rate=1:duration=8",
+      "-c:v", "mpeg4", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1",
+    ], { encoding: "buffer" });
+    const classifierUrl = "http://classifier.test/classify";
+    classifyNsfwMock.mockImplementation((file, type, animated) =>
+      classifyNsfw(file, type, animated, { ensembleClassifierUrl: classifierUrl, ensembleThreshold: 0.8, maxFrames: 8 }));
+    readVideoMetadataMock.mockResolvedValue({ duration: 8, width: 32, height: 32 });
+    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-album" });
+    storeTelegramMediaGroupMock.mockResolvedValue({ telegramMessageIds: [1, 2, 3] });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = String(input);
+      if (url === classifierUrl) {
+        return reason === "threshold" ? Response.json({ owen: 0.8, siglip: 0.1 }) : new Response(null, { status: 503 });
+      }
+      if (url === "https://eblo.id/ALBUM01") return new Response(
+        '<video class="album-media" src="https://cdn.example/clip.mp4"></video>' +
+        '<img class="album-media" src="https://cdn.example/a.jpg"><img class="album-media" src="https://cdn.example/b.jpg">',
+      );
+      if (url.endsWith(".mp4")) return new Response(new Uint8Array(video), { headers: { "content-type": "video/mp4" } });
+      return new Response("photo", { headers: { "content-type": "image/jpeg" } });
+    });
+    try {
+      const { processDownloadQueue, waitForDownloadQueue } = await import("./downloader.js");
+      processDownloadQueue();
+      await waitForDownloadQueue();
+
+      expect(fetchMock.mock.calls.filter(([url]) => String(url) === classifierUrl)).toHaveLength(1);
+      expect(classifyNsfwMock.mock.calls.map(([, type]) => type)).toEqual(["video"]);
+      expect(storeTelegramMediaGroupMock.mock.calls[0]?.[0].map((item: { mediaType: string }) => item.mediaType)).toEqual(["video", "image", "image"]);
+      expect(prismaMock.asset.upsert).toHaveBeenCalledWith(expect.objectContaining({
+        create: expect.objectContaining({ publicHasSpoiler: true }), update: expect.objectContaining({ publicHasSpoiler: true }),
+      }));
     } finally {
       fetchMock.mockRestore();
     }
@@ -515,6 +749,7 @@ describe("media album limits", () => {
       await waitForDownloadQueue();
 
       expect(storeTelegramMediaGroupMock.mock.calls[0]?.[0].map((item: { mediaType: string }) => item.mediaType)).toEqual(["image", "video"]);
+      expect(storeTelegramMediaGroupMock.mock.calls[0]?.[0][1].videoMetadata).toEqual({ duration: 10, width: 16, height: 16 });
       expect(prismaMock.asset.upsert).toHaveBeenCalledWith(expect.objectContaining({
         create: expect.objectContaining({ telegramMediaTypes: ["photo", "video"] }),
       }));

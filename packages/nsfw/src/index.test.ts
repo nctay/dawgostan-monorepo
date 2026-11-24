@@ -32,7 +32,13 @@ describe("NSFW classification", () => {
         await promisify(execFile)("ffmpeg", ["-v", "error", "-loop", "1", "-i", image, "-t", "1", "-vf", "fps=8", ...(extension === "mp4" ? ["-c:v", "mpeg4"] : []), media]);
         fetchMock.mockClear();
         expect(await classifyNsfw(media, mediaType, animated, config)).toEqual({ publicSpoiler: true, owenScore: 0.81, siglipScore: 0.2, status: "ok" });
-        expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        if (animated) {
+          fetchMock.mockClear().mockResolvedValue({ ok: true, json: async () => ({ owen: 0.1, siglip: 0.2 }) });
+          expect((await classifyNsfw(media, mediaType, animated, config)).publicSpoiler).toBe(false);
+          expect(fetchMock).toHaveBeenCalledTimes(8);
+          fetchMock.mockResolvedValue({ ok: true, json: async () => ({ owen: 0.81, siglip: 0.2 }) });
+        }
       }
     } finally {
       vi.unstubAllGlobals();
@@ -40,41 +46,105 @@ describe("NSFW classification", () => {
     }
   });
 
-  it("fast-seeks video frames instead of decoding the whole video until timeout", async () => {
+  it.each([
+    { sourceFrames: 1, decoderError: false },
+    { sourceFrames: 8, decoderError: false },
+    { sourceFrames: 8, decoderError: true },
+  ])("handles an unknown-duration WebM with $sourceFrames source frames and decoderError=$decoderError", async ({ sourceFrames, decoderError }) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dawgostan-nsfw-webm-"));
+    const file = path.join(directory, "stream.webm");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ owen: 0.1, siglip: 0.2 }) });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const { stdout } = await promisify(execFile)("ffmpeg", ["-v", "error", "-f", "lavfi", "-i",
+        "testsrc2=size=64x64:rate=8", "-frames:v", String(sourceFrames), "-c:v", "libvpx", "-f", "webm", "pipe:1"], { encoding: "buffer" });
+      await fs.writeFile(file, stdout);
+      const probe = await promisify(execFile)("ffprobe", ["-v", "error", "-count_frames", "-show_entries", "stream=nb_read_frames:format=duration", "-of", "csv=p=0", file]);
+      expect(probe.stdout.trim().split(/\s+/)).toEqual([String(sourceFrames), "N/A"]);
+      if (decoderError) {
+        fetchMock.mockImplementationOnce(async () => {
+          await fs.writeFile(file, "invalid media for the second pass");
+          return Response.json({ owen: 0.1, siglip: 0.2 });
+        });
+      }
+      const result = await classifyNsfw(file, "video", false, config);
+      expect(result).toEqual(decoderError
+        ? { publicSpoiler: true, status: "error" }
+        : { publicSpoiler: false, status: "ok", owenScore: 0.1, siglipScore: 0.2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([1, 2, 8, null])("extracts only the needed GIF batches and checks distinct frames in order when the hit is %s", async hit => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dawgostan-nsfw-gif-"));
+    const file = path.join(directory, "animated.gif");
+    try {
+      await promisify(execFile)("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=1:duration=8", file]);
+      await promisify(execFile)("ffmpeg", ["-v", "error", "-i", file, "-q:v", "1", path.join(directory, "expected-%d.jpg")]);
+      const expected = await Promise.all(Array.from({ length: 8 }, (_, i) => fs.readFile(path.join(directory, `expected-${i + 1}.jpg`))));
+      const seen: number[] = [];
+      const reads = vi.spyOn(fs, "readFile");
+      const prepared: number[] = [];
+      vi.stubGlobal("fetch", async (_url: string, { body }: { body: Buffer }) => {
+        const frame = expected.findIndex(bytes => bytes.equals(body)) + 1;
+        seen.push(frame);
+        prepared.push((await fs.readdir(path.dirname(String(reads.mock.lastCall![0])))).length);
+        return Response.json({ owen: frame === hit ? 0.8 : 0.1, siglip: 0.2 });
+      });
+      expect(await classifyNsfw(file, "image", true, config)).toEqual({ publicSpoiler: hit !== null, status: "ok", owenScore: hit === null ? 0.1 : 0.8, siglipScore: 0.2 });
+      expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 8].slice(0, hit ?? 8));
+      expect(prepared).toEqual([1, 2, 4, 4, 8, 8, 8, 8].slice(0, hit ?? 8));
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { hit: 1, expected: 1 }, { hit: 5, expected: 5 }, { hit: null, expected: 8 },
+  ])("extracts and classifies $expected evenly spaced video frames when the first hit is $hit", async ({ hit, expected }) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dawgostan-nsfw-seek-test-"));
     const video = path.join(directory, "video.mp4");
     const binDir = path.join(directory, "bin");
-    const previousPath = process.env.PATH;
     await fs.mkdir(binDir);
     await fs.writeFile(video, "fixture");
-    await fs.writeFile(path.join(binDir, "ffprobe"), `#!/usr/bin/env node
-process.stdout.write("198.56\\n");
+    await fs.writeFile(path.join(binDir, "ffprobe"), "#!/bin/sh\necho 200\n", { mode: 0o755 });
+    // Put the arguments in each fake frame so the classifier receives a record of how it was extracted.
+    await fs.writeFile(path.join(binDir, "ffmpeg"), `#!/bin/sh
+for arg in "$@"; do output=$arg; done
+echo frame >> "$0.calls"
+printf '%s\\n' "$@" > "$output"
 `, { mode: 0o755 });
-    await fs.writeFile(path.join(binDir, "ffmpeg"), `#!/usr/bin/env node
-const fs = require("node:fs");
-const args = process.argv.slice(2);
-const seek = args.indexOf("-ss");
-const input = args.indexOf("-i");
-if (seek < 0 || seek > input) {
-  setTimeout(() => process.exit(1), 1000);
-} else {
-  fs.writeFileSync(args.at(-1), "frame");
-}
-`, { mode: 0o755 });
-    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ owen: 0.1, siglip: 0.2 }) });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("PATH", `${binDir}${path.delimiter}${process.env.PATH}`);
+    const commands: string[][] = [];
+    vi.stubGlobal("fetch", async (_url: string, { body }: { body: Buffer }) => {
+      commands.push(body.toString().trimEnd().split("\n"));
+      return { ok: true, json: async () => ({ owen: 0.1, siglip: commands.length === hit ? 0.8 : 0.2 }) };
+    });
 
     try {
-      expect(await classifyNsfw(video, "video", false, { ...config, requestTimeoutMs: 500 })).toEqual({
-        publicSpoiler: false,
+      expect(await classifyNsfw(video, "video", false, config)).toEqual({
+        publicSpoiler: hit !== null,
         owenScore: 0.1,
-        siglipScore: 0.2,
+        siglipScore: hit !== null ? 0.8 : 0.2,
         status: "ok",
       });
-      expect(fetchMock).toHaveBeenCalledTimes(8);
+      expect((await fs.readFile(path.join(binDir, "ffmpeg.calls"), "utf8")).trim().split("\n")).toHaveLength(expected);
+      expect(commands).toHaveLength(expected);
+      for (const [index, args] of commands.entries()) {
+        const seek = args.indexOf("-ss");
+        const input = args.indexOf("-i");
+        expect(seek).toBeGreaterThanOrEqual(0);
+        expect(seek).toBeLessThan(input);
+        expect(args[seek + 1]).toBe(String(index * 25));
+        expect(args[input + 1]).toBe(video);
+      }
     } finally {
-      process.env.PATH = previousPath;
+      vi.unstubAllEnvs();
       vi.unstubAllGlobals();
       await fs.rm(directory, { recursive: true, force: true });
     }
