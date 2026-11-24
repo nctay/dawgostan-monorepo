@@ -33,11 +33,17 @@ const publishDeletedChatMessageMock = vi.hoisted(() => vi.fn());
 const publishStoredTelegramMediaMock = vi.hoisted(() => vi.fn());
 const chatClientMock = vi.hoisted(() => ({
   connect: vi.fn(),
+  disconnect: vi.fn(),
+  terminate: vi.fn(),
   getChannels: vi.fn(),
   join: vi.fn(),
   on: vi.fn(),
 }));
+const eventSubMock = vi.hoisted(() => ({ on: vi.fn(), terminate: vi.fn() }));
+const saveChatMediaPostMock = vi.hoisted(() => vi.fn());
+vi.mock("./chat-media-post.js", () => ({ saveChatMediaPost: saveChatMediaPostMock }));
 const prismaMock = vi.hoisted(() => ({
+  $queryRaw: vi.fn(),
   streamer: {
     findMany: vi.fn(),
     findUnique: vi.fn(),
@@ -57,26 +63,10 @@ const prismaMock = vi.hoisted(() => ({
   },
   twitchChatMessage: {
     findUnique: vi.fn(),
-    upsert: vi.fn(),
     deleteMany: vi.fn(),
   },
   chatPost: {
     findMany: vi.fn(),
-    create: vi.fn(),
-    update: vi.fn(),
-    findFirst: vi.fn(),
-  },
-  blockedMedia: {
-    findUnique: vi.fn(),
-  },
-  asset: {
-    findUnique: vi.fn(),
-    upsert: vi.fn(),
-    updateMany: vi.fn(),
-  },
-  downloadJob: {
-    findFirst: vi.fn(),
-    create: vi.fn(),
   },
 }));
 
@@ -97,7 +87,9 @@ vi.mock("./telegram-storage.js", () => ({
 vi.mock("tmi.js", () => ({
   default: {
     Client: class {
-      connect = chatClientMock.connect;
+      connect() { return chatClientMock.connect(); }
+      disconnect = chatClientMock.disconnect;
+      ws = { terminate: chatClientMock.terminate };
       getChannels = chatClientMock.getChannels;
       join = chatClientMock.join;
       on = chatClientMock.on;
@@ -106,10 +98,45 @@ vi.mock("tmi.js", () => ({
 }));
 
 vi.mock("ws", () => ({
-  default: class {},
+  default: class { on = eventSubMock.on; terminate = eventSubMock.terminate; },
 }));
 
 describe("twitch stream session grace", () => {
+  it("polls streams on every tick, retries failed profile sync and refreshes successful profiles hourly", async () => {
+    vi.resetModules();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(0);
+    const requests: string[] = [];
+    prismaMock.streamer.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.streamSession.updateMany.mockResolvedValue({ count: 0 });
+    prismaMock.streamer.upsert.mockClear();
+    vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      const route = new URL(url).pathname;
+      requests.push(route);
+      if (route.endsWith("/token")) return Response.json({ access_token: "fixture", expires_in: 86400 });
+      if (route.endsWith("/users")) return requests.filter(path => path === route).length === 1
+        ? new Response(null, { status: 503 }) : Response.json({ data: [{ id: "id", login: "streamer", display_name: "Streamer" }] });
+      return Response.json({ data: [] });
+    });
+    try {
+      const { pollTwitchStreams } = await import("./twitch.js");
+      for (const time of [0, 5_000, 10_000, 3_604_999, 3_605_000]) {
+        vi.setSystemTime(time);
+        await pollTwitchStreams();
+      }
+      expect(requests.filter(path => path.endsWith("/streams"))).toHaveLength(5);
+      expect(requests.filter(path => path.endsWith("/users"))).toHaveLength(3);
+      expect(prismaMock.streamer.upsert).toHaveBeenCalledTimes(2);
+      const expired = prismaMock.streamSession.updateMany.mock.calls.filter(([args]) => args.data.status === "ended");
+      expect(expired).toHaveLength(5);
+      for (const [args] of expired) expect(args.where.streamer).toEqual({ login: { in: ["streamer"] }, NOT: { twitchUserId: { startsWith: "wtv:" } } });
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps reconnects within thirty minutes in the same session", () => {
     expect(isWithinOfflineGrace(new Date("2026-05-24T10:00:00Z"), new Date("2026-05-24T10:30:00Z"))).toBe(true);
   });
@@ -179,6 +206,7 @@ describe("twitch chat membership", () => {
     vi.setSystemTime(new Date("2026-10-11T20:00:00Z"));
     envMock.TWITCH_CHANNELS = "streamer,ahmad153";
     chatClientMock.connect.mockResolvedValue(["irc-ws.chat.twitch.tv", 443]);
+    chatClientMock.disconnect.mockResolvedValue(undefined);
     chatClientMock.getChannels.mockReturnValue(["#streamer"]);
     chatClientMock.join.mockResolvedValue(["#ahmad153"]);
   });
@@ -200,29 +228,117 @@ describe("twitch chat membership", () => {
     await ensureChatConnected();
     expect(chatClientMock.join).toHaveBeenCalledWith("ahmad153");
   });
+
+  it.each(["native", "ws"])("stops an unanswered IRC handshake with the %s socket and excludes reconnects", async transport => {
+    const { ensureChatConnected, ensureEventSubConnected, stopTwitchConnections } = await import("./twitch.js");
+    chatClientMock.connect.mockImplementation(() => new Promise(() => {}));
+    chatClientMock.disconnect.mockImplementation(() => new Promise(() => {}));
+    ensureEventSubConnected();
+    const connecting = ensureChatConnected();
+    const client = chatClientMock.on.mock.contexts[0] as { ws: { terminate?: () => void } };
+    if (transport === "native") delete client.ws.terminate;
+    await Promise.all([stopTwitchConnections(), connecting]);
+    expect(chatClientMock.disconnect).toHaveBeenCalledOnce();
+    expect(chatClientMock.terminate).toHaveBeenCalledTimes(transport === "native" ? 0 : 1);
+    expect(eventSubMock.terminate).toHaveBeenCalledOnce();
+    const [, onClose] = eventSubMock.on.mock.calls.find(([event]) => event === "close")!;
+    onClose();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await ensureChatConnected();
+    ensureEventSubConnected();
+    expect(chatClientMock.connect).toHaveBeenCalledOnce();
+    expect(eventSubMock.on.mock.calls.filter(([event]) => event === "close")).toHaveLength(1);
+  });
+});
+
+const liveChatContext = { streamSessionId: "session-1", startedAt: new Date("2026-06-12T10:00:00Z"), youtubeDisabledUntil: null };
+
+describe("Twitch IRC message lookups", () => {
+  const url = "https://example.com/media.jpg";
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.resetAllMocks();
+    prismaMock.$queryRaw.mockResolvedValue([liveChatContext]);
+    saveChatMediaPostMock.mockResolvedValue({ outcome: "queued", assetId: "asset-1", postId: "post-1" });
+  });
+
+  async function receive(text: string, id?: string) {
+    const { ensureChatConnected } = await import("./twitch.js");
+    await ensureChatConnected();
+    const [, handler] = chatClientMock.on.mock.calls.find(([event]) => event === "message")!;
+    await handler("#streamer", { id, username: "viewer" }, text, false);
+  }
+
+  it.each([
+    { text: "plain text", id: "plain", lookups: 1, jobs: 0 },
+    { text: url, id: "media", lookups: 1, jobs: 1 },
+    { text: url, id: undefined, lookups: 1, jobs: 1 },
+    { text: "plain text", id: undefined, lookups: 0, jobs: 0 },
+    { text: `!sr ${url}`, id: "ignored", lookups: 0, jobs: 0 },
+  ])("looks up the context $lookups time(s) for '$text' with ID $id", async ({ text, id, lookups, jobs }) => {
+    await receive(text, id);
+    expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(lookups);
+    expect(saveChatMediaPostMock).toHaveBeenCalledTimes(jobs);
+  });
+
+  it("rechecks an offline session on the next message", async () => {
+    prismaMock.$queryRaw.mockResolvedValueOnce([{ ...liveChatContext, streamSessionId: null, startedAt: null }]);
+    await receive(url, "offline");
+    expect(prismaMock.$queryRaw).toHaveBeenCalledOnce();
+    expect(saveChatMediaPostMock).not.toHaveBeenCalled();
+
+    await receive(url, "live");
+    expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(saveChatMediaPostMock).toHaveBeenCalledOnce();
+  });
+
+  it("skips media for an unknown streamer without another lookup", async () => {
+    prismaMock.$queryRaw.mockResolvedValueOnce([]);
+    await receive(url, "media");
+    expect(prismaMock.$queryRaw).toHaveBeenCalledOnce();
+    expect(saveChatMediaPostMock).not.toHaveBeenCalled();
+  });
+
+  it("can still queue media after a buffer write fails", async () => {
+    prismaMock.$queryRaw.mockRejectedValueOnce(new Error("buffer write failed"));
+    await receive(url, "media");
+    expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(saveChatMediaPostMock).toHaveBeenCalledOnce();
+  });
 });
 
 describe("twitch media ingestion", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.resetAllMocks();
+    prismaMock.$queryRaw.mockResolvedValue([liveChatContext]);
     envMock.ALLOW_PRIVATE_MEDIA_HOSTS = false;
+  });
+
+  it("continues past a duplicate post to queue the next URL", async () => {
+    const { ingestChatMessage } = await import("./twitch.js");
+    saveChatMediaPostMock
+      .mockResolvedValueOnce({ outcome: "duplicate" })
+      .mockResolvedValueOnce({ outcome: "queued", assetId: "asset-2", postId: "post-2" });
+
+    await ingestChatMessage({
+      streamerLogin: "streamer",
+      twitchMessageId: "message-1",
+      authorName: "Viewer",
+      messageText: "https://youtu.be/abc123 https://example.com/next.jpg",
+      postedAt: new Date("2026-06-12T10:04:00Z"),
+    });
+
+    expect(publishStoredTelegramMediaMock).not.toHaveBeenCalled();
+    expect(saveChatMediaPostMock).toHaveBeenCalledTimes(2);
+    expect(saveChatMediaPostMock).toHaveBeenLastCalledWith(expect.objectContaining({ originalUrl: "https://example.com/next.jpg" }));
   });
 
   it.each(["https://youtu.be/abc123", "https://www.instagram.com/reel/Chunk8-jurw/?igsh=shared"])("queues media with its public Telegram skip flag: %s", async (url) => {
     const { ingestChatMessage } = await import("./twitch.js");
-    prismaMock.streamer.findUnique.mockResolvedValue({
-      id: "streamer-1",
-      login: "streamer",
-      youtubeDisabledUntil: new Date("2000-01-01T00:00:00Z"),
-    });
-    prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
-    prismaMock.blockedMedia.findUnique.mockResolvedValue(null);
-    prismaMock.asset.findUnique.mockResolvedValue(null);
-    prismaMock.chatPost.create.mockResolvedValue({ id: "post-1" });
-    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-1" });
-    prismaMock.downloadJob.findFirst.mockResolvedValue(null);
-    prismaMock.downloadJob.create.mockResolvedValue({});
+    prismaMock.$queryRaw.mockResolvedValue([{ ...liveChatContext, youtubeDisabledUntil: new Date("2000-01-01T00:00:00Z") }]);
+    saveChatMediaPostMock.mockResolvedValue({ outcome: "queued", assetId: "asset-1", postId: "post-1" });
 
     await ingestChatMessage({
       streamerLogin: "streamer",
@@ -232,22 +348,12 @@ describe("twitch media ingestion", () => {
       postedAt: new Date("2026-06-12T10:04:00Z"),
     });
 
-    expect(prismaMock.chatPost.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ skipTelegramPublic: true }) }),
-    );
-    expect(prismaMock.downloadJob.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ url }) }),
-    );
+    expect(saveChatMediaPostMock).toHaveBeenCalledWith(expect.objectContaining({ originalUrl: url, skipTelegramPublic: true }));
   });
 
   it("skips YouTube while it is disabled for the streamer", async () => {
     const { ingestChatMessage } = await import("./twitch.js");
-    prismaMock.streamer.findUnique.mockResolvedValue({
-      id: "streamer-1",
-      login: "ankohu",
-      youtubeDisabledUntil: new Date("2099-01-01T00:00:00Z"),
-    });
-    prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
+    prismaMock.$queryRaw.mockResolvedValue([{ ...liveChatContext, youtubeDisabledUntil: new Date("2099-01-01T00:00:00Z") }]);
 
     await ingestChatMessage({
       streamerLogin: "ankohu",
@@ -257,8 +363,7 @@ describe("twitch media ingestion", () => {
       postedAt: new Date("2026-06-12T10:04:00Z"),
     });
 
-    expect(prismaMock.chatPost.create).not.toHaveBeenCalled();
-    expect(prismaMock.downloadJob.create).not.toHaveBeenCalled();
+    expect(saveChatMediaPostMock).not.toHaveBeenCalled();
   });
 
   it.each(["clck.su", "bit.ly", "tinyurl.com", "clck.ru"])("resolves %s short links before queueing media", async (host) => {
@@ -270,14 +375,7 @@ describe("twitch media ingestion", () => {
         ? new Response(null, { status: 302, headers: { location: resolvedUrl } })
         : new Response("image", { status: 200, headers: { "content-type": "image/png" } }),
     ) as typeof fetch;
-    prismaMock.streamer.findUnique.mockResolvedValue({ id: "streamer-1", login: "streamer" });
-    prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
-    prismaMock.blockedMedia.findUnique.mockResolvedValue(null);
-    prismaMock.asset.findUnique.mockResolvedValue(null);
-    prismaMock.chatPost.create.mockResolvedValue({ id: "post-1" });
-    prismaMock.asset.upsert.mockResolvedValue({ id: "asset-1" });
-    prismaMock.downloadJob.findFirst.mockResolvedValue(null);
-    prismaMock.downloadJob.create.mockResolvedValue({});
+    saveChatMediaPostMock.mockResolvedValue({ outcome: "queued", assetId: "asset-1", postId: "post-1" });
 
     await ingestChatMessage({
       streamerLogin: "streamer",
@@ -287,17 +385,10 @@ describe("twitch media ingestion", () => {
       postedAt: new Date("2026-06-12T10:04:00Z"),
     });
 
-    expect(prismaMock.chatPost.create).toHaveBeenCalledWith(
+    expect(saveChatMediaPostMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({
-          originalUrl: resolvedUrl,
-          normalizedUrl: "https://cdn.discordapp.com/attachments/1/2/image.png",
-        }),
-      }),
-    );
-    expect(prismaMock.downloadJob.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ url: resolvedUrl }),
+        originalUrl: resolvedUrl,
+        normalizedUrl: "https://cdn.discordapp.com/attachments/1/2/image.png",
       }),
     );
   });
@@ -489,30 +580,6 @@ describe("twitch EventSub deleted messages", () => {
     expect(publishDeletedChatMessageMock).not.toHaveBeenCalled();
     expect(prismaMock.deletedChatMessage.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ skipTelegramPublic: true }) }),
-    );
-  });
-
-  it("records live chat messages for later delete events", async () => {
-    const { recordChatMessage } = await import("./twitch.js");
-    prismaMock.streamer.findUnique.mockResolvedValue({ id: "streamer-1", login: "streamer" });
-    prismaMock.streamSession.findFirst.mockResolvedValue({ id: "session-1", startedAt: new Date("2026-06-12T10:00:00Z") });
-    prismaMock.twitchChatMessage.upsert.mockResolvedValue({});
-
-    await recordChatMessage({
-      streamerLogin: "streamer",
-      twitchMessageId: "msg-1",
-      authorTwitchId: "42",
-      authorLogin: "viewer",
-      authorName: "Viewer",
-      messageText: "plain chat text",
-      postedAt: new Date("2026-06-12T10:04:00Z"),
-    });
-
-    expect(prismaMock.twitchChatMessage.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { streamerId_twitchMessageId: { streamerId: "streamer-1", twitchMessageId: "msg-1" } },
-        create: expect.objectContaining({ messageText: "plain chat text" }),
-      }),
     );
   });
 

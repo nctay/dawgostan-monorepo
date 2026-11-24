@@ -9,7 +9,10 @@ type BotAlertInput = {
 
 export function logBotAlert(input: BotAlertInput): void {
   const classified = classifyBotError(input.error);
-  const errorText = botErrorText(input.error);
+  let errorText = botErrorText(input.error);
+  for (const token of [process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_PUBLIC_BOT_TOKEN, process.env.TELEGRAM_CONVERTER_BOT_TOKEN]) {
+    if (token) errorText = errorText.replaceAll(token, "[redacted]");
+  }
   console.error(
     JSON.stringify({
       alert_code: input.code ?? "telegram_bot_error",

@@ -28,7 +28,7 @@ export function logServiceAlert(alert: ServiceAlert): void {
       error_message: errorText.slice(0, 2_000),
       alert_detail: errorText.replace(/\s+/g, " ").slice(0, 300),
       ...(alert.details ? { details: alert.details } : {}),
-    }),
+    }, (_key, value: unknown) => typeof value === "string" ? redactTelegramTokens(value) : value),
   );
 }
 
@@ -65,7 +65,16 @@ export function classifyOperationalError(error: unknown): { code: string; reason
 export function operationalErrorText(error: unknown): string {
   const parts: string[] = [];
   collectErrorParts(error, parts, new Set<object>(), 0);
-  return parts.join(" | ") || String(error);
+  return redactTelegramTokens(parts.join(" | ") || String(error));
+}
+
+export function redactTelegramTokens(text: string): string {
+  // Node transport errors include the credential in both bot API and file URLs.
+  let safe = text.replace(/\/bot\d+(?::|%3a)[\w-]+/gi, "/bot[redacted]");
+  for (const token of [process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_PUBLIC_BOT_TOKEN, process.env.TELEGRAM_CONVERTER_BOT_TOKEN]) {
+    if (token) safe = safe.replaceAll(token, "[redacted]");
+  }
+  return safe;
 }
 
 function collectErrorParts(value: unknown, parts: string[], seen: Set<object>, depth: number): void {

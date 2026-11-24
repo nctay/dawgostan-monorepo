@@ -1,5 +1,7 @@
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { telegramFetch } from "@dawgostan/core/telegram-fetch";
 import { Bot, InputFile } from "grammy";
 import type { Message } from "grammy/types";
 import { env, privateStreamerLogins } from "../env.js";
@@ -10,9 +12,28 @@ import { SerialRateLimiter } from "./rate-limit.js";
 
 let bot: Bot | null = null;
 const storageSendLimiter = new SerialRateLimiter(1100);
-const publicChannelSendLimiter = new SerialRateLimiter(1100);
+export const publicChannelSendLimiter = new SerialRateLimiter(1100);
 const deletedChannelSendLimiter = new SerialRateLimiter(1100);
 export const telegramMediaGroupMaxItems = 10;
+export const publicRepeatWindowMs = 48 * 60 * 60 * 1000;
+const execFileAsync = promisify(execFile);
+let freeVideoToolSlots = 2;
+const waitingForVideoTool: Array<() => void> = [];
+
+// The two slots are shared by every upload, including overlapping albums.
+async function withVideoToolSlot<T>(run: () => Promise<T>): Promise<T> {
+  if (freeVideoToolSlots > 0) freeVideoToolSlots--;
+  else await new Promise<void>(resolve => waitingForVideoTool.push(resolve));
+  try {
+    return await run();
+  } finally {
+    const next = waitingForVideoTool.shift();
+    if (next) next();
+    else freeVideoToolSlots++;
+  }
+}
+
+export type VideoMetadata = { width?: number; height?: number; duration?: number };
 
 type TelegramStoredAsset = {
   telegramChatId: string | null;
@@ -51,13 +72,14 @@ export type StoreMediaMetadata = {
   messageText: string;
   skipTelegramPublic: boolean;
   telegramSendAsAnimation?: boolean;
+  videoMetadata?: VideoMetadata;
 };
 
 export type PublicTelegramMediaMetadata = Pick<StoreMediaMetadata, "streamerLogin" | "streamStartedAt" | "authorName" | "messageText" | "skipTelegramPublic">;
 
 function telegramBot(): Bot {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
-  bot ??= new Bot(env.TELEGRAM_BOT_TOKEN);
+  bot ??= new Bot(env.TELEGRAM_BOT_TOKEN, { client: { fetch: telegramFetch } });
   return bot;
 }
 
@@ -73,7 +95,9 @@ export async function storeTelegramMedia(filePath: string, mimeType: string, med
   ].join("\n");
 
   const input = new InputFile(filePath, fileName(filePath, mimeType, mediaType));
-  const videoMetadata = mediaType === "video" ? await readVideoMetadata(filePath) : {};
+  const videoMetadata = mediaType === "video"
+    ? await prepareVideoForStorage(filePath, metadata.videoMetadata, !metadata.telegramSendAsAnimation && !isGif(mimeType))
+    : {};
   const message = await storageSendLimiter.schedule<Message.PhotoMessage | Message.VideoMessage | Message.AnimationMessage>(async () => {
     if (isGif(mimeType) || metadata.telegramSendAsAnimation) {
       console.log(`[telegram] sendAnimation mime=${mimeType} file=${path.basename(filePath)}`);
@@ -108,7 +132,7 @@ export async function storeTelegramMedia(filePath: string, mimeType: string, med
   };
 }
 
-export async function storeTelegramMediaGroup(files: Array<{ filePath: string; mimeType: string; mediaType: "image" | "video" }>, metadata: StoreMediaMetadata): Promise<StoredMedia> {
+export async function storeTelegramMediaGroup(files: Array<{ filePath: string; mimeType: string; mediaType: "image" | "video"; videoMetadata?: VideoMetadata }>, metadata: StoreMediaMetadata): Promise<StoredMedia> {
   if (!env.TELEGRAM_STORAGE_CHAT_ID) throw new Error("TELEGRAM_STORAGE_CHAT_ID is not configured");
   if (files.length < 2) throw new Error("Telegram media group requires at least two files");
 
@@ -125,7 +149,7 @@ export async function storeTelegramMediaGroup(files: Array<{ filePath: string; m
     if (batch.length === 1) {
       const file = batch[0]!;
       const input = new InputFile(file.filePath, fileName(file.filePath, file.mimeType, file.mediaType));
-      const videoMetadata = file.mediaType === "video" ? await readVideoMetadata(file.filePath) : {};
+      const videoMetadata = file.mediaType === "video" ? await prepareVideoForStorage(file.filePath, file.videoMetadata) : {};
       messages.push(await storageSendLimiter.schedule<Message.PhotoMessage | Message.VideoMessage>(() => file.mediaType === "video"
         ? telegramBot().api.sendVideo(env.TELEGRAM_STORAGE_CHAT_ID!, input, { ...(offset === 0 ? { caption } : {}), supports_streaming: true, ...videoMetadata })
         : telegramBot().api.sendPhoto(env.TELEGRAM_STORAGE_CHAT_ID!, input, offset === 0 ? { caption } : {})));
@@ -133,9 +157,9 @@ export async function storeTelegramMediaGroup(files: Array<{ filePath: string; m
       const media = await Promise.all(batch.map(async (file, index) => {
         const input = new InputFile(file.filePath, fileName(file.filePath, file.mimeType, file.mediaType));
         const itemCaption = offset === 0 && index === 0 ? { caption } : {};
-        return file.mediaType === "video"
-          ? { type: "video" as const, media: input, supports_streaming: true, ...await readVideoMetadata(file.filePath), ...itemCaption }
-          : { type: "photo" as const, media: input, ...itemCaption };
+        if (file.mediaType === "image") return { type: "photo" as const, media: input, ...itemCaption };
+        const videoMetadata = await prepareVideoForStorage(file.filePath, file.videoMetadata);
+        return { type: "video" as const, media: input, supports_streaming: true, ...videoMetadata, ...itemCaption };
       }));
       const sent = await storageSendLimiter.schedule(() => telegramBot().api.sendMediaGroup(env.TELEGRAM_STORAGE_CHAT_ID!, media));
       messages.push(...sent as Array<Message.PhotoMessage | Message.VideoMessage>);
@@ -155,6 +179,26 @@ export async function storeTelegramMediaGroup(files: Array<{ filePath: string; m
     telegramMediaTypes: messages.map((message) => "video" in message ? "video" : "photo"),
     telegramFileUniqueId: storedFiles[0]!.file_unique_id,
   };
+}
+
+async function prepareVideoForStorage(filePath: string, cached: VideoMetadata | undefined, includeCover = true) {
+  const metadata = cached ?? await readVideoMetadata(filePath);
+  if (!includeCover) return metadata;
+  return { ...metadata, ...await videoCover(filePath, metadata.duration) };
+}
+
+async function videoCover(filePath: string, duration?: number): Promise<{ cover: InputFile; thumbnail: InputFile } | undefined> {
+  try {
+    // shortcut: a five-second frame can still be black after a long intro; select a non-black frame if this recurs.
+    const { stdout } = await withVideoToolSlot(() => execFileAsync("ffmpeg", [
+      "-v", "error", "-ss", String(Math.min(5, Math.max(0, (duration ?? 6) - 1))), "-i", filePath,
+      "-frames:v", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+    ], { encoding: "buffer", maxBuffer: 200_000, timeout: 10_000, killSignal: "SIGKILL" }));
+    if (!stdout.length) return undefined;
+    return { cover: new InputFile(stdout, "cover.jpg"), thumbnail: new InputFile(stdout, "thumbnail.jpg") };
+  } catch {
+    return undefined;
+  }
 }
 
 export async function publishStoredTelegramMedia(
@@ -182,7 +226,7 @@ export async function publishStoredTelegramMedia(
   }
 
   const claimedAt = new Date();
-  const cutoff = new Date(claimedAt.getTime() - 48 * 60 * 60 * 1000);
+  const cutoff = new Date(claimedAt.getTime() - publicRepeatWindowMs);
   // shortcut: a crash after this claim can suppress an unsent post for 48 hours; add a lease if this occurs.
   const claim = await prisma.asset.updateMany({
     where: { id: asset.id, visibility: "public", OR: [{ publicTelegramPublishedAt: null }, { publicTelegramPublishedAt: { lte: cutoff } }] },
@@ -203,7 +247,8 @@ export async function publishStoredTelegramMedia(
 
   await prisma.asset.update({
     where: { id: asset.id },
-    data: { publicTelegramChatId: copied.telegramChatId, publicTelegramMessageId: copied.telegramMessageId, publicTelegramPublishedAt: new Date() },
+    data: { publicTelegramChatId: copied.telegramChatId, publicTelegramMessageId: copied.telegramMessageId,
+      publicTelegramPublishedAt: new Date(), publicTelegramConfirmedAt: new Date() },
   });
 }
 
@@ -216,7 +261,7 @@ function isGif(mimeType: string): boolean {
   return mimeType.split(";")[0]?.trim().toLowerCase() === "image/gif";
 }
 
-export async function readVideoMetadata(filePath: string, reportFailure = true): Promise<{ width?: number; height?: number; duration?: number }> {
+export async function readVideoMetadata(filePath: string, reportFailure = true): Promise<VideoMetadata> {
   try {
     const output = await runFfprobe([
       "-v",
@@ -257,22 +302,8 @@ export async function readVideoCodec(filePath: string): Promise<string | undefin
 }
 
 async function runFfprobe(args: string[]): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn("ffprobe", args, { stdio: ["ignore", "pipe", "pipe"] });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve(Buffer.concat(stdout).toString("utf8"));
-        return;
-      }
-      reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `ffprobe exit code ${code}`));
-    });
-  });
+  const { stdout } = await withVideoToolSlot(() => execFileAsync("ffprobe", args));
+  return stdout;
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -287,25 +318,30 @@ async function publishTelegramMedia(asset: TelegramStoredAsset, metadata: Public
 }
 
 async function sendStoredTelegramMedia(chatId: string, asset: TelegramStoredAsset, caption: string): Promise<{ message_id: number }> {
-  const albumFileIds = asset.telegramFileIds ?? [];
-  if (albumFileIds.length > 1) {
-    let firstMessageId: number | undefined;
-    for (let offset = 0; offset < albumFileIds.length; offset += telegramMediaGroupMaxItems) {
-      const batch = albumFileIds.slice(offset, offset + telegramMediaGroupMaxItems);
-      const sent = batch.length === 1
-        ? asset.telegramMediaTypes?.[offset] === "video"
-          ? await telegramBot().api.sendVideo(chatId, batch[0]!, { caption, supports_streaming: true, ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}) })
-          : await telegramBot().api.sendPhoto(chatId, batch[0]!, { caption, ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}) })
-        : await telegramBot().api.sendMediaGroup(chatId, batch.map((fileId, index) => ({
-            type: asset.telegramMediaTypes?.[offset + index] === "video" ? "video" as const : "photo" as const,
-            media: fileId,
-            ...(index === 0 ? { caption } : {}),
-            ...(asset.publicHasSpoiler ? { has_spoiler: true } : {}),
-          })));
-      firstMessageId ??= (Array.isArray(sent) ? sent[0] : sent)?.message_id;
+  const first = await sendStoredTelegramMediaBatch(chatId, asset, caption, 0);
+  for (let offset = telegramMediaGroupMaxItems; offset < (asset.telegramFileIds?.length ?? 0); offset += telegramMediaGroupMaxItems) {
+    await sendStoredTelegramMediaBatch(chatId, asset, caption, offset);
+  }
+  return first;
+}
+
+export async function sendStoredTelegramMediaBatch(chatId: string, asset: TelegramStoredAsset, caption: string, offset: number): Promise<{ message_id: number }> {
+  if (asset.telegramFileIds && asset.telegramFileIds.length > 1) {
+    const batch = asset.telegramFileIds.slice(offset, offset + telegramMediaGroupMaxItems);
+    const spoiler = asset.publicHasSpoiler ? { has_spoiler: true } : {};
+    if (batch.length === 1) {
+      return asset.telegramMediaTypes?.[offset] === "video"
+        ? telegramBot().api.sendVideo(chatId, batch[0]!, { caption, supports_streaming: true, ...spoiler })
+        : telegramBot().api.sendPhoto(chatId, batch[0]!, { caption, ...spoiler });
     }
-    if (!firstMessageId) throw new Error("Telegram did not return a public album message");
-    return { message_id: firstMessageId };
+    const sent = await telegramBot().api.sendMediaGroup(chatId, batch.map((fileId, index) => ({
+      type: asset.telegramMediaTypes?.[offset + index] === "video" ? "video" as const : "photo" as const,
+      media: fileId,
+      ...(index === 0 ? { caption } : {}),
+      ...spoiler,
+    })));
+    if (!sent[0]) throw new Error("Telegram did not return a public album message");
+    return sent[0];
   }
   if (!asset.publicHasSpoiler) {
     return telegramBot().api.copyMessage(chatId, asset.telegramChatId!, asset.telegramMessageId!, { caption });
@@ -366,7 +402,7 @@ export async function publishDeletedChatMessage(metadata: DeletedChatMessageMeta
   return { telegramChatId: String(sent.chat.id), telegramMessageId: sent.message_id };
 }
 
-function publicChannelCaption(metadata: PublicTelegramMediaMetadata): string {
+export function publicChannelCaption(metadata: PublicTelegramMediaMetadata): string {
   const streamerTag = hashtag(`${metadata.streamerLogin}_stream`);
   const dateTag = hashtag(`date_${formatStreamDateTag(metadata.streamStartedAt)}`);
   const senderTag = hashtag(`user_${metadata.authorName}`);

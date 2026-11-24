@@ -1,16 +1,23 @@
-import { Bot, GrammyError, InlineKeyboard } from "grammy";
+import { setTimeout as delay } from "node:timers/promises";
+import { Bot, BotError, Composer, GrammyError, HttpError, InlineKeyboard } from "grammy";
+import { sequentialize } from "@grammyjs/runner";
 import type { Context } from "grammy";
+import { stripSkipTelegramPublicTag } from "@dawgostan/core";
 import type { Prisma } from "@prisma/client";
 import { allowedUserIds, env, privateStreamerLogins } from "./env.js";
 import { prisma } from "./prisma.js";
-import { SerialRateLimiter, withTelegramRetry } from "./rate-limit.js";
+import { canRetryTelegramSend, ChatRateLimiter, publicTelegramFetch, telegramCall, telegramSignal } from "./rate-limit.js";
 import { logBotAlert } from "./alert-log.js";
 import { createConverterBot } from "./converter.js";
+import { createPublicPolling } from "./public-polling.js";
+import { isTransientDatabaseError, retryInbox } from "./database-errors.js";
+import { ackOnly, mediaPage } from "./public-page.js";
+import { publicInbox, PublicInboxError } from "./public-inbox.js";
 
 const pageSize = 10;
 const publicPageSize = 50;
-const bots: Bot[] = [];
-const publicChatLimiters = new Map<number | string, SerialRateLimiter>();
+const lifecycle = new AbortController();
+const bots: Pick<Bot, "start" | "stop">[] = [];
 
 const adminBot = new Bot(env.TELEGRAM_BOT_TOKEN);
 bots.push(adminBot);
@@ -166,66 +173,135 @@ adminBot.callbackQuery(/^del:(.+)$/, async (ctx) => {
 
 adminBot.catch((error) => logBotError("admin-bot", error));
 
-const publicBot = env.TELEGRAM_PUBLIC_BOT_TOKEN ? new Bot(env.TELEGRAM_PUBLIC_BOT_TOKEN) : null;
+const publicPageLimiter = new ChatRateLimiter(1100, lifecycle.signal);
+const publicBot = env.TELEGRAM_PUBLIC_BOT_TOKEN
+  ? new Bot(env.TELEGRAM_PUBLIC_BOT_TOKEN, { client: { fetch: publicTelegramFetch } })
+  : null;
 if (publicBot) {
-  bots.push(publicBot);
+  // Duplicate callbacks can be acknowledged while the owner is still sending.
+  publicBot.use((ctx, next) => ackOnly in ctx.update ? handlePublicUpdate(ctx, true) : next());
+  publicBot.use(sequentialize((ctx) => ctx.chat?.id.toString()));
 
-  publicBot.command("start", async (ctx) => {
+  const routes = new Composer<Context>();
+  routes.command("start", async (ctx) => {
     await sendPublicStreamers(ctx, 0);
   });
 
-  publicBot.command("streamers", async (ctx) => {
+  routes.command("streamers", async (ctx) => {
     await sendPublicStreamers(ctx, 0);
   });
 
-  publicBot.callbackQuery(/^pub:streamers:(\d+)$/, async (ctx) => {
+  routes.callbackQuery(/^pub:streamers:(\d+)$/, async (ctx) => {
     await answerCallbackQuerySafely(ctx);
     await sendPublicStreamers(ctx, Number(ctx.match[1]));
   });
 
-  publicBot.callbackQuery(/^pub:streamer:([^:]+):(\d+)$/, async (ctx) => {
+  routes.callbackQuery(/^pub:streamer:([^:]+):(\d+)$/, async (ctx) => {
     await answerCallbackQuerySafely(ctx);
     await sendPublicStreams(ctx, ctx.match[1]!, Number(ctx.match[2]));
   });
 
-  publicBot.callbackQuery(/^pub:stream:([^:]+):(\d+)$/, async (ctx) => {
-    await answerCallbackQuerySafely(ctx);
-    await sendPublicMessages(ctx, ctx.match[1]!, Number(ctx.match[2]));
-  });
+  const dispatch = routes.middleware();
+  let receiptFailure: PublicInboxError | undefined;
+  publicBot.use(ctx => handlePublicUpdate(ctx, false));
+
+  async function handlePublicUpdate(ctx: Context, duplicatePage: boolean) {
+    if (receiptFailure) throw receiptFailure;
+    try {
+      const page = mediaPage.exec(ctx.callbackQuery?.data ?? "");
+      let pageAcknowledged = false;
+      let pageConsumed = false;
+      for (let wait = 100; ; wait = Math.min(wait * 2, 30_000)) {
+        try {
+          if (page && !pageAcknowledged) {
+            await answerCallbackQuerySafely(ctx);
+            pageAcknowledged = true;
+          }
+          if (page) {
+            if (!duplicatePage) {
+              await sendPublicMessages(ctx, page[2]!, Number(page[3]), async () => {
+                const claimed = await publicInbox(ctx.me.id).claimPage(ctx.update.update_id, lifecycle.signal);
+                pageConsumed = true;
+                return claimed;
+              }, page[1] === "after");
+            }
+          } else {
+            await dispatch(ctx, async () => {});
+          }
+          break;
+        } catch (error) {
+          if (error instanceof PublicInboxError) throw error;
+          const dbUnavailable = isTransientDatabaseError(error);
+          // Only claiming a media page commits us to at-most-once delivery.
+          const retryTelegram = canRetryTelegramSend(error) || (page && !pageAcknowledged && error instanceof HttpError);
+          if (pageConsumed || (!dbUnavailable && !retryTelegram)) {
+            logBotError("public-bot", new BotError(error, ctx));
+            break;
+          }
+          const retryAfter = error instanceof GrammyError ? error.parameters.retry_after : undefined;
+          logBotAlert({ scope: "public-bot", error: new Error(dbUnavailable ? "Database temporarily unavailable" : "Telegram temporarily unavailable") });
+          try {
+            await delay(retryAfter ? retryAfter * 1000 : wait, undefined, { signal: lifecycle.signal });
+          } catch {
+            throw new PublicInboxError("Public bot stopped during retry");
+          }
+        }
+      }
+      await publicInbox(ctx.me.id).finish(ctx.update.update_id, lifecycle.signal);
+    } catch (error) {
+      if (error instanceof PublicInboxError) {
+        receiptFailure = error;
+        lifecycle.abort();
+      }
+      throw error;
+    }
+  }
 
   publicBot.catch((error) => logBotError("public-bot", error));
+  bots.push(createPublicPolling(publicBot));
 }
 
 const converterBot = createConverterBot();
 if (converterBot) {
-  converterBot.catch((error) => logBotError("converter-bot", new Error(error.message.replaceAll(env.TELEGRAM_CONVERTER_BOT_TOKEN!, "[redacted]"))));
+  converterBot.catch((error) => logBotError("converter-bot", error));
   bots.push(converterBot);
 }
 
-process.on("SIGINT", () => void shutdown());
-process.on("SIGTERM", () => void shutdown());
+let stopping = false;
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
-await withTelegramRetry(() =>
-  adminBot.api.setMyCommands([
+try {
+  const signal = telegramSignal(lifecycle.signal);
+  await telegramCall("setMyCommands", () => adminBot.api.setMyCommands([
     { command: "start", description: "Меню" },
     { command: "live", description: "Live-стримы" },
     { command: "streams", description: "Последние стримы" },
     { command: "latest", description: "Последние 10 медиа" },
     { command: "stream", description: "Медиа стрима по id" },
-  ]),
-);
-
-if (publicBot) {
-  await withTelegramRetry(() =>
-    publicBot.api.setMyCommands([
+  ], {}, signal), lifecycle.signal);
+  if (publicBot) {
+    await telegramCall("setMyCommands", () => publicBot.api.setMyCommands([
       { command: "start", description: "Выбрать стримера" },
       { command: "streamers", description: "Список стримеров" },
-    ]),
-  );
+    ], {}, signal), lifecycle.signal);
+  }
+} catch (error) {
+  if (!stopping) throw error;
 }
 
 console.log(`[bot] starting admin${publicBot ? " and public" : ""}${converterBot ? " and converter" : ""}`);
-await Promise.all(bots.map((runningBot) => runningBot.start()));
+try {
+  if (!stopping) await Promise.all(bots.map((runningBot) => runningBot.start()));
+} catch (error) {
+  if (!stopping) {
+    logBotError("polling", error);
+    process.exitCode = 1;
+    shutdown();
+  }
+} finally {
+  await prisma.$disconnect();
+}
 
 type MediaFilter = "all" | "image" | "video";
 type PostWithMedia = Prisma.ChatPostGetPayload<{
@@ -248,14 +324,13 @@ async function answerCallbackQuerySafely(ctx: Context, options?: CallbackQueryOp
 }
 
 function logBotError(scope: string, error: unknown): void {
-  const botError = error as { error?: unknown; ctx?: Context; name?: string };
-  const cause = botError.error ?? error;
+  const botError = error instanceof BotError ? error : undefined;
   logBotAlert({
     scope,
-    error: cause,
+    error: botError?.error ?? error,
     details: {
-      update_id: botError.ctx?.update.update_id,
-      handler: botError.name,
+      update_id: botError?.ctx.update.update_id,
+      handler: botError?.name,
     },
   });
 }
@@ -417,73 +492,100 @@ async function sendPublicStreams(ctx: Context, streamerId: string, offset: numbe
   await ctx.reply(`Стримы: ${streamer.displayName}`, { reply_markup: keyboard });
 }
 
-async function sendPublicMessages(ctx: Context, streamId: string, offset: number): Promise<void> {
+async function sendPublicMessages(ctx: Context, streamId: string, offset: number, claimPage: () => Promise<boolean>, after = false): Promise<void> {
+  const send = <T>(task: () => Promise<T>) => publicPageLimiter.schedule(ctx.chat!.id, task);
+  const cursor = after ? await prisma.chatPost.findUnique({
+    where: { id: streamId }, select: { id: true, streamSessionId: true, postedAt: true },
+  }) : null;
+  if (after && !cursor) {
+    await send(() => ctx.reply("Стрим не найден."));
+    return;
+  }
+  if (cursor) streamId = cursor.streamSessionId;
   const session = await prisma.streamSession.findUnique({
     where: { id: streamId },
     include: { streamer: true },
   });
-  if (!session) {
-    await ctx.reply("Стрим не найден.");
-    return;
-  }
-  if (!canAccessPublicStreamer(ctx, session.streamer.login)) {
-    await ctx.reply("Стрим не найден.");
+  if (!session || !canAccessPublicStreamer(ctx, session.streamer.login)) {
+    await send(() => ctx.reply("Стрим не найден."));
     return;
   }
 
   const posts = await prisma.chatPost.findMany({
     where: {
       streamSessionId: streamId,
-      ...publicStoredPostWhere(),
+      asset: {
+        ...publicStoredPostWhere().asset,
+        posts: {
+          some: { streamSessionId: streamId, ...publicStoredPostWhere() },
+          // Position each asset by its newest reference, independent of privacy edits.
+          ...(cursor ? { none: {
+            streamSessionId: streamId,
+            OR: [{ postedAt: { gt: cursor.postedAt } }, { postedAt: cursor.postedAt, id: { gte: cursor.id } }],
+          } } : {}),
+        },
+      },
+      ...(cursor ? {
+        OR: [{ postedAt: { lt: cursor.postedAt } }, { postedAt: cursor.postedAt, id: { lt: cursor.id } }],
+      } : {}),
     },
-    orderBy: { postedAt: "desc" },
+    orderBy: [{ postedAt: "desc" }, { id: "desc" }],
     distinct: ["assetId"],
-    skip: offset,
+    skip: cursor ? 0 : offset,
     take: publicPageSize,
-    include: { asset: true },
+    select: { id: true, assetId: true },
   });
 
   if (posts.length === 0) {
-    await ctx.reply("Сообщений больше нет.");
+    await send(() => ctx.reply("Сообщений больше нет."));
     return;
   }
 
-  const keyboard = new InlineKeyboard()
-    .text("Назад к датам", `pub:streamer:${session.streamerId}:0`)
-    .row()
-    .text("Показать еще", `pub:stream:${streamId}:${offset + publicPageSize}`);
-
-  await withTelegramRetry(() => ctx.reply(`${session.streamer.displayName} / ${formatDate(session.startedAt)}`));
+  // Telegram cannot replay a partially sent page idempotently. Only consume it
+  // once it reaches the front of its chat, immediately before the first send.
+  await publicPageLimiter.waitForTurn(ctx.chat!.id);
+  if (!(await claimPage())) return;
+  await send(() => ctx.reply(`${session.streamer.displayName} / ${formatDate(session.startedAt)}`));
 
   let copied = 0;
-  for (const post of uniquePostsByAsset(posts)) {
-    const asset = post.asset;
-    if (!asset?.telegramChatId || !asset.telegramMessageId) continue;
-
-    if (asset.telegramMessageIds.length > 1) {
-      const copied = await schedulePublicChatMessage(ctx.chat!.id, () =>
-        ctx.api.copyMessages(ctx.chat!.id, asset.telegramChatId!, asset.telegramMessageIds, { remove_caption: true }),
-      );
-      if (copied[0]) {
-        await schedulePublicChatMessage(ctx.chat!.id, () =>
-          ctx.api.editMessageCaption(ctx.chat!.id, copied[0]!.message_id, { caption: publicMediaCaption(post) }),
-        );
+  for (const { assetId } of posts) {
+    // Moderation and VOD recovery can change a selected post while its slot or retry is waiting.
+    const visiblePost = () => retryInbox(() => prisma.chatPost.findFirst({
+      where: { assetId, streamSessionId: streamId, ...publicStoredPostWhere() },
+      orderBy: [{ postedAt: "desc" }, { id: "desc" }],
+      include: { asset: true },
+    }), lifecycle.signal);
+    const delivery = await send(async () => {
+      const post = await visiblePost();
+      const asset = post?.asset;
+      if (!post || !asset?.telegramChatId || !asset.telegramMessageId) return null;
+      if (asset.telegramMessageIds.length > 1) {
+        const album = await ctx.api.copyMessages(ctx.chat!.id, asset.telegramChatId, asset.telegramMessageIds, { remove_caption: true });
+        return album[0] ? { captionMessageId: album[0].message_id } : null;
       }
-    } else {
-      await schedulePublicChatMessage(ctx.chat!.id, () =>
-        ctx.api.copyMessage(ctx.chat!.id, asset.telegramChatId!, asset.telegramMessageId!, {
-          caption: publicMediaCaption(post),
-        }),
-      );
+      await ctx.api.copyMessage(ctx.chat!.id, asset.telegramChatId, asset.telegramMessageId, { caption: publicMediaCaption(post) });
+      return { captionMessageId: null };
+    });
+    if (!delivery) continue;
+    const { captionMessageId } = delivery;
+    if (captionMessageId !== null) {
+      await send(async () => {
+        const post = await visiblePost();
+        if (post) await ctx.api.editMessageCaption(ctx.chat!.id, captionMessageId, { caption: publicMediaCaption(post) });
+      });
     }
     copied += 1;
   }
 
   if (copied === 0) {
-    await withTelegramRetry(() => ctx.reply("В этой пачке нет доступных Telegram-медиа."));
+    await send(() => ctx.reply("В этой пачке нет доступных Telegram-медиа."));
   }
 
-  await schedulePublicChatMessage(ctx.chat!.id, () => ctx.reply(`Показано: ${offset + copied}`, { reply_markup: keyboard }));
+  const keyboard = new InlineKeyboard()
+    .text("Назад к датам", `pub:streamer:${session.streamerId}:0`)
+    .row()
+    .text("Показать еще", `pub:after:${posts.at(-1)!.id}:${offset + copied}`);
+  await send(() => ctx.reply(`Показано: ${offset + copied}`, { reply_markup: keyboard }));
 }
 
 async function sendPosts(ctx: Context, posts: PostWithMedia[]): Promise<void> {
@@ -603,21 +705,8 @@ function publicMediaCaption(post: PublicPostWithAsset): string {
   return truncate(`${prefix}: ${text}`, 1000);
 }
 
-function schedulePublicChatMessage<T>(chatId: number | string, task: () => Promise<T>): Promise<T> {
-  let limiter = publicChatLimiters.get(chatId);
-  if (!limiter) {
-    limiter = new SerialRateLimiter(1100);
-    publicChatLimiters.set(chatId, limiter);
-  }
-  return limiter.schedule(task);
-}
-
 function stripUrls(text: string): string {
   return text.replace(/https?:\/\/\S+/gi, "").trim();
-}
-
-function stripSkipTelegramPublicTag(text: string): string {
-  return text.replace(/!skip_tg(?=https?:\/\/|\s|$)/gi, " ").replace(/\s+/g, " ").trim();
 }
 
 function truncate(text: string, maxLength: number): string {
@@ -644,8 +733,10 @@ function formatMoscowTime(date: Date): string {
   }).format(date);
 }
 
-async function shutdown(): Promise<void> {
+function shutdown(): void {
+  if (stopping) return;
+  stopping = true;
+  lifecycle.abort();
   console.log("[bot] stopping");
-  for (const runningBot of bots) runningBot.stop();
-  await prisma.$disconnect();
+  for (const runningBot of bots) void runningBot.stop().catch((error) => logBotError("shutdown", error));
 }

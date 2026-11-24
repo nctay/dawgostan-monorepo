@@ -1,57 +1,85 @@
-export class SerialRateLimiter {
-  private nextRunAt = 0;
-  private chain: Promise<void> = Promise.resolve();
+import { setTimeout as delay } from "node:timers/promises";
+import { GrammyError, HttpError, type Bot } from "grammy";
+import { logBotAlert } from "./alert-log.js";
 
-  constructor(private readonly intervalMs: number) {}
+export { telegramFetch as publicTelegramFetch } from "@dawgostan/core/telegram-fetch";
 
-  schedule<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(async () => {
-      const waitMs = Math.max(0, this.nextRunAt - Date.now());
-      if (waitMs > 0) await sleep(waitMs);
-      this.nextRunAt = Date.now() + this.intervalMs;
-      return withTelegramRetry(task);
-    });
+export class ChatRateLimiter {
+  private readonly cooldowns = new Map<number, Promise<void>>();
 
-    this.chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+  constructor(private readonly intervalMs: number, private readonly signal: AbortSignal) {}
+
+  async waitForTurn(chatId: number): Promise<void> {
+    await this.cooldowns.get(chatId);
   }
-}
 
-export async function withTelegramRetry<T>(task: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
+  schedule<T>(chatId: number, task: () => Promise<T>): Promise<T> {
+    return withTelegramRetry(() => this.send(chatId, task), this.signal);
+  }
+
+  private async send<T>(chatId: number, task: () => Promise<T>): Promise<T> {
+    const previous = this.cooldowns.get(chatId);
+    let release!: () => void;
+    const cooldown = new Promise<void>(resolve => { release = resolve; });
+    this.cooldowns.set(chatId, cooldown);
+    await previous;
+    const nextSendAt = Date.now() + this.intervalMs;
+    const unlock = () => {
+      if (this.cooldowns.get(chatId) === cooldown) this.cooldowns.delete(chatId);
+      release();
+    };
     try {
       return await task();
-    } catch (error) {
-      const retryAfter = telegramRetryAfterSeconds(error);
-      if (retryAfter) {
-        if (attempt >= 3) throw error;
-        await sleep((retryAfter + 1) * 1000);
-        continue;
-      }
-
-      if (!isTransientNetworkError(error) || attempt >= 5) throw error;
-      await sleep(Math.min(30_000, 1000 * 2 ** attempt));
+    } finally {
+      const remaining = nextSendAt - Date.now();
+      if (remaining > 0) setTimeout(unlock, remaining);
+      else unlock();
     }
   }
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function telegramRetryAfterSeconds(error: unknown): number | null {
-  const maybe = error as { error_code?: number; parameters?: { retry_after?: number } };
-  if (maybe.error_code === 429 && typeof maybe.parameters?.retry_after === "number") {
-    return maybe.parameters.retry_after;
+export function canRetryTelegramSend(error: unknown): boolean {
+  if (error instanceof GrammyError) {
+    return error.error_code === 429 || (error.error_code >= 500 && error.error_code < 600);
   }
-  return null;
+  // DNS failures precede delivery. A reset or timeout can follow acceptance.
+  if (!(error instanceof HttpError)) return false;
+  const code = (error.error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOTFOUND" || code === "EAI_AGAIN";
 }
 
-function isTransientNetworkError(error: unknown): boolean {
-  const maybe = error as { error?: { code?: string }; code?: string };
-  const code = maybe.error?.code ?? maybe.code;
-  return code === "ETIMEDOUT" || code === "ECONNRESET" || code === "EAI_AGAIN" || code === "ENOTFOUND";
+async function withTelegramRetry<T>(task: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  for (let wait = 1000; ; wait = Math.min(30_000, wait * 2)) {
+    try {
+      return await task();
+    } catch (error) {
+      if (!canRetryTelegramSend(error)) throw error;
+      const retryAfter = error instanceof GrammyError ? error.parameters.retry_after : undefined;
+      await delay(retryAfter ? retryAfter * 1000 : wait, undefined, { signal });
+      signal.throwIfAborted();
+    }
+  }
+}
+
+// grammY on Node uses the older abort-controller declaration for the same signal API.
+export function telegramSignal(signal: AbortSignal) {
+  return signal as unknown as NonNullable<Parameters<Bot["init"]>[0]>;
+}
+
+// Never log or rethrow transport errors. Their nested cause can contain the bot token.
+export async function telegramCall<T>(method: string, call: () => Promise<T>, signal: AbortSignal) {
+  for (let wait = 100; ; wait = Math.min(30_000, wait * 2)) {
+    signal.throwIfAborted();
+    try {
+      return await call();
+    } catch (error) {
+      signal.throwIfAborted();
+      const status = error instanceof GrammyError ? error.error_code : undefined;
+      const message = `Telegram ${method} failed${status ? ` (HTTP ${status})` : ""}`;
+      logBotAlert({ scope: method, error: { message, error_code: status } });
+      if (!(error instanceof HttpError) && status !== 429 && !(status && status >= 500)) throw new Error(message);
+      const retryAfter = error instanceof GrammyError ? error.parameters.retry_after : undefined;
+      await delay(retryAfter ? retryAfter * 1000 : wait, undefined, { signal });
+    }
+  }
 }

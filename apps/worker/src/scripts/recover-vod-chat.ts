@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import { extractUrls, isSupportedMediaUrl, normalizeUrl } from "@dawgostan/core";
 import { env } from "../env.js";
 import { prisma } from "../prisma.js";
-import { isIgnoredChatAuthor, isIgnoredChatCommand } from "../services/chat-filter.js";
+import { saveChatMediaPost } from "../services/chat-media-post.js";
+import { hasSkipTelegramPublicTag, isIgnoredChatAuthor, isIgnoredChatCommand, stripSkipTelegramPublicTag } from "../services/chat-filter.js";
 
 const TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 const PAGE_SIZE = 100;
@@ -169,7 +170,7 @@ async function processPage(video: TwitchVideo, sessionId: string): Promise<void>
       continue;
     }
 
-    const urls = extractUrls(messageText).filter(isSupportedMediaUrl);
+    const urls = extractUrls(stripSkipTelegramPublicTag(messageText)).filter(isSupportedMediaUrl);
     for (const rawUrl of urls) {
       const normalizedUrl = normalizeUrl(rawUrl);
       if (!normalizedUrl) continue;
@@ -200,6 +201,25 @@ async function recoverMediaUrl(input: {
   postedAt: Date;
 }): Promise<void> {
   const twitchMessageId = `vod:${videoId}:${input.comment.id}:${hash(input.normalizedUrl)}`;
+  if (!dryRun) {
+    const result = await saveChatMediaPost({
+      twitchMessageId,
+      rawTwitchMessageId: `vod:${videoId}:${input.comment.id}`,
+      streamSessionId: input.sessionId,
+      authorTwitchId: input.comment.commenter?.id,
+      authorName: input.authorName,
+      messageText: input.messageText,
+      skipTelegramPublic: hasSkipTelegramPublicTag(input.messageText),
+      originalUrl: input.rawUrl,
+      normalizedUrl: input.normalizedUrl,
+      postedAt: input.postedAt,
+    });
+    const counter = { duplicate: "existingPosts", blocked: "blocked", stored: "reused", active: "duplicatePending", queued: "queued" } as const;
+    stats[counter[result.outcome]] += 1;
+    if (result.outcome === "queued") console.log(`[recovery] queued chatPost=${result.postId} asset=${result.assetId} url=${input.rawUrl}`);
+    return;
+  }
+
   const existingPost = await prisma.chatPost.findUnique({ where: { twitchMessageId } });
   if (existingPost) {
     stats.existingPosts += 1;
@@ -209,11 +229,6 @@ async function recoverMediaUrl(input: {
   const blocked = await prisma.blockedMedia.findUnique({ where: { normalizedUrl: input.normalizedUrl } });
   if (blocked) {
     stats.blocked += 1;
-    if (!dryRun) {
-      await prisma.chatPost.create({
-        data: chatPostData(input, twitchMessageId, { status: "blocked" }),
-      });
-    }
     return;
   }
 
@@ -221,11 +236,6 @@ async function recoverMediaUrl(input: {
   const reusableAsset = existingAsset?.status === "stored" ? existingAsset : await findStoredAssetForNormalizedUrl(input.normalizedUrl);
   if (reusableAsset) {
     stats.reused += 1;
-    if (!dryRun) {
-      await prisma.chatPost.create({
-        data: chatPostData(input, twitchMessageId, { assetId: reusableAsset.id, status: "stored" }),
-      });
-    }
     return;
   }
 
@@ -239,71 +249,6 @@ async function recoverMediaUrl(input: {
     : null;
   if (activeJob) stats.duplicatePending += 1;
   else stats.queued += 1;
-
-  if (dryRun) return;
-
-  const post = await prisma.chatPost.create({
-    data: chatPostData(input, twitchMessageId, {
-      assetId: existingAsset?.id,
-      status: "pending",
-    }),
-  });
-  const asset =
-    existingAsset ??
-    (await prisma.asset.upsert({
-      where: { normalizedUrl: input.normalizedUrl },
-      update: {},
-      create: {
-        originalUrl: input.rawUrl,
-        normalizedUrl: input.normalizedUrl,
-        mediaType: "other",
-        status: "pending",
-      },
-    }));
-
-  if (activeJob) {
-    await prisma.chatPost.update({ where: { id: post.id }, data: { assetId: asset.id } });
-    return;
-  }
-
-  await prisma.downloadJob.create({
-    data: {
-      assetId: asset.id,
-      chatPostId: post.id,
-      url: input.rawUrl,
-      status: "pending",
-    },
-  });
-  console.log(`[recovery] queued chatPost=${post.id} asset=${asset.id} url=${input.rawUrl}`);
-}
-
-function chatPostData(
-  input: {
-    sessionId: string;
-    comment: TwitchComment;
-    authorName: string;
-    messageText: string;
-    rawUrl: string;
-    normalizedUrl: string;
-    postedAt: Date;
-  },
-  twitchMessageId: string,
-  extra: { assetId?: string; status: "pending" | "stored" | "blocked" },
-) {
-  const rawTwitchMessageId = `vod:${videoId}:${input.comment.id}`;
-  return {
-    streamSessionId: input.sessionId,
-    twitchMessageId,
-    rawTwitchMessageId,
-    authorTwitchId: input.comment.commenter?.id,
-    authorName: input.authorName,
-    messageText: input.messageText,
-    originalUrl: input.rawUrl,
-    normalizedUrl: input.normalizedUrl,
-    postedAt: input.postedAt,
-    assetId: extra.assetId,
-    status: extra.status,
-  };
 }
 
 async function findStoredAssetForNormalizedUrl(normalizedUrl: string) {

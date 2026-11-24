@@ -7,6 +7,19 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model PublicBotUpdate {
+  botId      BigInt
+  updateId   Int
+  receivedAt DateTime @default(now())
+  payload    Json?
+  pageKey    String?
+
+  @@id([botId, updateId])
+  @@unique([botId, pageKey])
+  @@index([botId, receivedAt])
+  @@map("public_bot_updates")
+}
+
 enum StreamerStatus {
   unknown
   online
@@ -136,6 +149,9 @@ model StreamSession {
   endedAt         DateTime?
   status          StreamSessionStatus  @default(live)
   streamer        Streamer             @relation(fields: [streamerId], references: [id], onDelete: Cascade)
+  wtvMessageOwners WtvMessageOwner[]
+  wtvRedirects    WtvRedirect[]
+  wtvPendingMessages WtvPendingMessage[]
   posts           ChatPost[]
   chatMessages    TwitchChatMessage[]
   deletedMessages DeletedChatMessage[]
@@ -143,6 +159,49 @@ model StreamSession {
   @@index([streamerId, startedAt])
   @@index([status])
   @@map("stream_sessions")
+}
+
+// Keep the first broadcast and privacy decision after retry payloads are cleaned up.
+model WtvMessageOwner {
+  messageId          String @id
+  sessionId          String
+  skipTelegramPublic Boolean @default(false)
+  session            StreamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("wtv_message_owners")
+}
+
+// Pin the first destination of a short URL for this w.tv message across polls.
+model WtvRedirect {
+  sessionId String
+  messageId String
+  sourceUrl String
+  targetUrl String
+  // Empty after validation. During resolution, preserves the hop limit and cycle detection across restarts.
+  visitedUrls String[] @default([])
+  session   StreamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@id([sessionId, messageId, sourceUrl])
+  @@map("wtv_redirects")
+}
+
+// Original chat context for short links that still need to reach the archive.
+model WtvPendingMessage {
+  skipTelegramPublic Boolean @default(false)
+  sessionId     String
+  messageId     String
+  sourceUrls    String[]
+  authorName    String
+  authorTwitchId String?
+  messageText   String
+  postedAt      DateTime
+  lastAttemptAt DateTime @default(now())
+  session       StreamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@id([sessionId, messageId])
+  @@index([sessionId, lastAttemptAt])
+  @@map("wtv_pending_messages")
 }
 
 model ChatPost {
@@ -158,6 +217,9 @@ model ChatPost {
   postedAt           DateTime
   assetId            String?
   skipTelegramPublic Boolean        @default(false)
+  publicRetryAt      DateTime?
+  publicClaimedAt    DateTime?
+  publicFileOffset   Int            @default(0)
   status             ChatPostStatus @default(pending)
   streamSession      StreamSession  @relation(fields: [streamSessionId], references: [id], onDelete: Cascade)
   asset              Asset?         @relation(fields: [assetId], references: [id], onDelete: SetNull)
@@ -235,6 +297,7 @@ model Asset {
   publicTelegramChatId String?
   publicTelegramMessageId Int?
   publicTelegramPublishedAt DateTime?
+  publicTelegramConfirmedAt DateTime?
   publicHasSpoiler     Boolean         @default(false)
   telegramIsAnimation  Boolean         @default(false)
   s3Key                String?

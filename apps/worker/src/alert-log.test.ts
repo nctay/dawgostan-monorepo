@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { HttpError } from "grammy";
 import { classifyOperationalError, logServiceAlert } from "./alert-log.js";
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe("operational alert logging", () => {
   it("classifies a nested DNS failure", () => {
@@ -10,6 +14,30 @@ describe("operational alert logging", () => {
     expect(classifyOperationalError(error)).toEqual({
       code: "dns",
       reason: "DNS не смог найти адрес внешнего сервиса",
+    });
+  });
+
+  it("keeps Telegram credentials out of nested transport errors and alert details", () => {
+    const token = "12345:worker_fixture";
+    const publicToken = "67890:public_fixture";
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", token);
+    vi.stubEnv("TELEGRAM_PUBLIC_BOT_TOKEN", publicToken);
+    const url = `https://api.telegram.org/bot${token}/sendVideo`;
+    const nested = new Error(`request to ${url} failed: getaddrinfo EAI_AGAIN`);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    logServiceAlert({
+      code: "download_failed", title: "Download failed", component: "downloader",
+      error: new HttpError("Network request failed", nested),
+      details: { response: `token=${publicToken}`, url: "https://api.telegram.org/file/bot999%3Aold_fixture/video.mp4" },
+    });
+
+    const line = String(errorSpy.mock.calls[0]?.[0]);
+    expect(line).not.toContain(token);
+    expect(line).not.toContain(publicToken);
+    expect(line).not.toContain("old_fixture");
+    expect(JSON.parse(line)).toMatchObject({
+      error_code: "dns", error_message: expect.stringContaining("/bot[redacted]/sendVideo"),
+      details: { response: "token=[redacted]", url: expect.stringContaining("/file/bot[redacted]/video.mp4") },
     });
   });
 

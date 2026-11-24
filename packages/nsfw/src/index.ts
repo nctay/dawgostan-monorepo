@@ -48,10 +48,10 @@ export async function classifyNsfw(
   const frameDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dawgostan-nsfw-"));
   try {
     const maxFrames = framesToCheck(mediaType, animated, config.maxFrames);
-    const frames = await extractFrames(filePath, path.join(frameDir, "ensemble"), maxFrames, false, timeoutMs, mediaType === "video");
+    let publicSpoiler = false;
     let highestOwen = 0;
     let highestSiglip = 0;
-    for (const frame of frames) {
+    for await (const frame of ensembleFrames(filePath, frameDir, maxFrames, mediaType, timeoutMs)) {
       const response = await fetch(config.ensembleClassifierUrl, {
         method: "POST",
         headers: { "content-type": "application/octet-stream" },
@@ -63,9 +63,11 @@ export async function classifyNsfw(
       if (!validScore(body.owen) || !validScore(body.siglip)) throw new Error("NSFW ensemble returned invalid scores");
       highestOwen = Math.max(highestOwen, body.owen);
       highestSiglip = Math.max(highestSiglip, body.siglip);
+      publicSpoiler = shouldSpoilerEnsemble(highestOwen, highestSiglip, config.ensembleThreshold);
+      if (publicSpoiler) break;
     }
     return {
-      publicSpoiler: shouldSpoilerEnsemble(highestOwen, highestSiglip, config.ensembleThreshold),
+      publicSpoiler,
       owenScore: highestOwen,
       siglipScore: highestSiglip,
       status: "ok",
@@ -173,31 +175,74 @@ export function frameFilters(maxFrames: number, duration: number, nsfwjs: boolea
   ];
 }
 
-async function extractFrames(filePath: string, outputDir: string, maxFrames: number, nsfwjs: boolean, timeoutMs: number, fastSeek = false): Promise<string[]> {
-  await fs.promises.mkdir(outputDir);
+async function* ensembleFrames(filePath: string, outputDir: string, maxFrames: number, mediaType: "image" | "video", timeoutMs: number) {
   const duration = maxFrames > 1 ? await readDuration(filePath, timeoutMs) : 0;
-  if (fastSeek && maxFrames > 1 && duration > 0) {
+  if (mediaType === "video" && duration > 0) {
+    let foundFrame = false;
     for (let index = 0; index < maxFrames; index += 1) {
       const timestamp = (duration * index) / maxFrames;
       const output = path.join(outputDir, `frame-${String(index + 1).padStart(2, "0")}.jpg`);
       await execFileAsync(
         "ffmpeg",
-        ["-v", "error", "-ss", String(timestamp), "-i", filePath, "-vf", frameFilters(1, 0, nsfwjs).join(",") || "null", "-frames:v", "1", "-q:v", nsfwjs ? "4" : "1", output],
+        ["-v", "error", "-ss", String(timestamp), "-i", filePath, "-frames:v", "1", "-q:v", "1", output],
         { timeout: timeoutMs },
       );
+      // A seek past the last decodable frame can succeed without producing a JPEG.
+      if (fs.existsSync(output)) {
+        foundFrame = true;
+        yield output;
+      }
     }
-  } else {
-    const output = path.join(outputDir, "frame-%02d.jpg");
-    await execFileAsync(
-      "ffmpeg",
-      ["-v", "error", "-i", filePath, "-vf", frameFilters(maxFrames, duration, nsfwjs).join(",") || "null", "-frames:v", String(maxFrames), "-q:v", nsfwjs ? "4" : "1", output],
-      { timeout: timeoutMs },
-    );
+    if (!foundFrame) throw new Error("ffmpeg extracted no frames");
+    return;
   }
-  const frames = (await fs.promises.readdir(outputDir))
-    .filter((name) => name.endsWith(".jpg"))
-    .sort()
-    .map((name) => path.join(outputDir, name));
+
+  if (maxFrames > 1) {
+    const fps = frameFilters(maxFrames, duration, false);
+    // Batches of 1, 1, 2, 4, ... keep early hits cheap without restarting the decoder for every sample.
+    let start = 0;
+    while (start < maxFrames) {
+      const count = Math.min(Math.max(1, start), maxFrames - start);
+      const filters = [...fps, `trim=start_frame=${start}`, "setpts=PTS-STARTPTS", "format=yuvj420p|yuvj422p|yuvj444p"];
+      // Explicit full-range JPEG formats also let ffmpeg finish successfully when trim reaches EOF.
+      await execFileAsync("ffmpeg", [
+        "-v", "error", "-xerror", "-i", filePath, "-vf", filters.join(","), "-frames:v", String(count),
+        "-q:v", "1", "-start_number", String(start + 1), path.join(outputDir, "frame-%02d.jpg"),
+      ], { timeout: timeoutMs });
+      const frames = (await frameFiles(outputDir)).slice(start);
+      if (start === 0 && frames.length === 0) {
+        if (duration > 0) throw new Error("ffmpeg extracted no frames");
+        break;
+      }
+      yield* frames;
+      if (frames.length < count) return;
+      start += count;
+    }
+    if (start > 0) return;
+  }
+
+  // A valid subsecond clip with unknown duration can end before fps=1 emits any sample.
+  const first = path.join(outputDir, "first.jpg");
+  await execFileAsync("ffmpeg", ["-v", "error", "-xerror", "-i", filePath, "-frames:v", "1", "-q:v", "1", first], { timeout: timeoutMs });
+  yield first;
+}
+
+async function writeFrames(filePath: string, output: string, filters: string[], count: number, nsfwjs: boolean, timeoutMs: number) {
+  await execFileAsync("ffmpeg", [
+    "-v", "error", "-i", filePath, "-vf", filters.join(",") || "null", "-frames:v", String(count), "-q:v", nsfwjs ? "4" : "1", output,
+  ], { timeout: timeoutMs });
+}
+
+async function frameFiles(outputDir: string) {
+  return (await fs.promises.readdir(outputDir)).filter(name => name.startsWith("frame-") && name.endsWith(".jpg"))
+    .sort().map(name => path.join(outputDir, name));
+}
+
+async function extractFrames(filePath: string, outputDir: string, maxFrames: number, nsfwjs: boolean, timeoutMs: number): Promise<string[]> {
+  await fs.promises.mkdir(outputDir);
+  const duration = maxFrames > 1 ? await readDuration(filePath, timeoutMs) : 0;
+  await writeFrames(filePath, path.join(outputDir, "frame-%02d.jpg"), frameFilters(maxFrames, duration, nsfwjs), maxFrames, nsfwjs, timeoutMs);
+  const frames = await frameFiles(outputDir);
   if (frames.length === 0) throw new Error("ffmpeg extracted no frames");
   return frames;
 }

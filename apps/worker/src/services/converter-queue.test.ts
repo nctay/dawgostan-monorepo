@@ -13,7 +13,7 @@ const env = vi.hoisted(() => ({
 const db = vi.hoisted(() => ({
   $queryRaw: vi.fn(),
   asset: { aggregate: vi.fn() },
-  downloadJob: { updateMany: vi.fn() },
+  downloadJob: { updateMany: vi.fn(), findMany: vi.fn() },
   conversionRequest: { findUnique: vi.fn(), findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn(), findMany: vi.fn(), aggregate: vi.fn() },
   converterUser: { findUnique: vi.fn() },
 }));
@@ -37,6 +37,7 @@ import { processDownloadQueue, recoverInterruptedDownloadJobs, waitForDownloadQu
 describe("conversion request queue", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    db.downloadJob.findMany.mockResolvedValue([]);
     let claimed = false;
     db.$queryRaw.mockImplementation(async (sql: TemplateStringsArray) => {
       if (sql.join("").includes('"conversion_requests"') && !claimed) { claimed = true; return [{ id: "request-1" }]; }

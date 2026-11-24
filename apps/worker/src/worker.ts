@@ -1,45 +1,10 @@
-import { cleanupExpiredChatMessages, ensureChatConnected, ensureEventSubConnected, pollTwitchStreams } from "./services/twitch.js";
-import { pollWtvStreams } from "./services/wtv.js";
-import { processDownloadQueue, recoverInterruptedDownloadJobs, waitForDownloadQueue } from "./services/downloader.js";
-import { prisma } from "./prisma.js";
-import { logServiceAlert } from "./alert-log.js";
+import { runWorker } from "./worker-loop.js";
 
-let shuttingDown = false;
-
-async function tick(): Promise<void> {
-  ensureEventSubConnected();
-  void ensureChatConnected().catch((error) =>
-    logServiceAlert({ code: "twitch_chat_connect_failed", title: "Twitch-чат недоступен", component: "twitch-chat", error }),
-  );
-  processDownloadQueue();
-  const tasks = [
-    { code: "twitch_poll_failed", title: "Не удалось проверить Twitch-стримы", component: "twitch", promise: pollTwitchStreams() },
-    { code: "wtv_task_failed", title: "Не удалось проверить WTV-стримы", component: "wtv", promise: pollWtvStreams() },
-    { code: "chat_cleanup_failed", title: "Не удалось очистить старые сообщения", component: "database", promise: cleanupExpiredChatMessages() },
-  ];
-  const results = await Promise.allSettled(tasks.map((task) => task.promise));
-  for (const [index, result] of results.entries()) {
-    if (result.status !== "rejected") continue;
-    const task = tasks[index]!;
-    logServiceAlert({ code: task.code, title: task.title, component: task.component, error: result.reason });
-  }
-}
-
-async function loop(): Promise<void> {
-  while (!shuttingDown) {
-    await tick();
-    await new Promise((resolve) => setTimeout(resolve, 5_000));
-  }
-}
-
-process.on("SIGINT", () => {
-  shuttingDown = true;
-});
-process.on("SIGTERM", () => {
-  shuttingDown = true;
-});
-
-await recoverInterruptedDownloadJobs();
-await loop();
-await waitForDownloadQueue();
-await prisma.$disconnect();
+const shutdown = new AbortController();
+process.on("SIGINT", () => shutdown.abort());
+process.on("SIGTERM", () => shutdown.abort());
+await runWorker(shutdown.signal);
+// tmi 1.x keeps private reconnect timers even after its socket has closed.
+await Promise.all([process.stdout, process.stderr].map(stream =>
+  new Promise<void>(resolve => stream.write("", () => resolve()))));
+process.exit();
